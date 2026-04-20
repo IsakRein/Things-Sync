@@ -22,8 +22,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 THINGS_BUNDLE_CANDIDATES = [
+    Path("/Applications/Things.app"),
     Path("/Applications/Things3.app"),
     Path("/Applications/Setapp/Things3.app"),
+    Path.home() / "Applications/Things.app",
     Path.home() / "Applications/Things3.app",
 ]
 
