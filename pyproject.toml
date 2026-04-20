@@ -1,0 +1,27 @@
+[project]
+name = "things-sync"
+version = "0.1.0"
+description = "General-purpose Things 3 wrapper: CRUD for projects, tasks, areas, and tags via SQLite (read) and Things Cloud (write)."
+readme = "README.md"
+authors = [
+    { name = "Isak Reinholdsson", email = "isak@isak.io" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.13.2",
+    "rich>=15.0.0",
+    "shortuuid>=1.0.13",
+    "typer>=0.24.1",
+]
+
+[project.scripts]
+things = "things_sync.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/IsakRein/Things-Sync"
+Source = "https://github.com/IsakRein/Things-Sync"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

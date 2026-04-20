@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Environments
+.env
+.envrc
+.zsh_secrets
+
+# uv
+uv.lock
+
+# macOS
+.DS_Store
