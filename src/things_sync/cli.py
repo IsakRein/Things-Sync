@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from . import cloud
+from . import appintents, cloud
 from .db import DEFAULT_DB_PATH, GROUP_CONTAINER, ThingsDB
 from .models import STATUS_COMPLETED, Task
 
@@ -713,6 +713,122 @@ def doctor() -> None:
         "[bold green]OK[/bold green]" if ok_all else "[bold red]FAIL[/bold red]"
     )
     raise typer.Exit(0 if ok_all else 1)
+
+
+intents_app = typer.Typer(
+    name="intents",
+    help="Inspect an app's App Intents catalog (Metadata.appintents).",
+    no_args_is_help=True,
+)
+app.add_typer(intents_app)
+
+
+BundleOpt = typer.Option(
+    None,
+    "--bundle",
+    "-b",
+    help="Path to <App>.app bundle (default: Things3.app).",
+)
+
+
+def _load_catalog(bundle: Path | None) -> appintents.Catalog:
+    if bundle is None:
+        bundle = appintents.find_things_bundle()
+        if bundle is None:
+            err.print(
+                "[red]Things3.app not found.[/red] "
+                "Pass --bundle /path/to/Any.app to inspect another app."
+            )
+            raise typer.Exit(1)
+    try:
+        return appintents.load(bundle)
+    except FileNotFoundError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+
+@intents_app.command("list")
+def intents_list(
+    bundle: Path | None = BundleOpt,
+    show_hidden: bool = typer.Option(False, "--all", help="Include non-discoverable intents."),
+) -> None:
+    """List every App Intent declared by an app."""
+    cat = _load_catalog(bundle)
+    items = list(cat.intents.values()) if show_hidden else cat.discoverable()
+    items.sort(key=lambda i: i.identifier)
+
+    table = Table(
+        title=f"[bold]{cat.bundle_path.name}[/bold]  [dim]({len(items)} intents)[/dim]",
+        title_justify="left",
+        box=SIMPLE_HEAVY,
+        header_style="bold",
+        expand=True,
+    )
+    table.add_column("identifier", no_wrap=True)
+    table.add_column("title")
+    table.add_column("params", justify="right", style="dim")
+    table.add_column("summary", ratio=2)
+    for i in items:
+        table.add_row(
+            i.identifier,
+            str(i.title),
+            str(len(i.parameters)),
+            i.summary.format_string or "",
+        )
+    console.print(table)
+    console.print(
+        f"[dim]entities={len(cat.entities)}  enums={len(cat.enums)}  "
+        f"generator={cat.generator.get('name', '?')} v{cat.generator.get('version', '?')}[/dim]"
+    )
+
+
+@intents_app.command("show")
+def intents_show(
+    identifier: str = typer.Argument(..., help="Intent identifier (exact or substring)."),
+    bundle: Path | None = BundleOpt,
+) -> None:
+    """Show one intent's parameters and types in detail."""
+    cat = _load_catalog(bundle)
+    needle = identifier.lower()
+    match = cat.intents.get(identifier) or next(
+        (i for i in cat.intents.values() if needle in i.identifier.lower()),
+        None,
+    )
+    if match is None:
+        err.print(f"[red]No intent matching[/red] {identifier!r}")
+        raise typer.Exit(1)
+
+    body = Text()
+    body.append("identifier: ", style="dim")
+    body.append(match.identifier + "\n")
+    body.append("type:       ", style="dim")
+    body.append(match.fully_qualified_type_name + "\n")
+    body.append("title:      ", style="dim")
+    body.append(str(match.title) + "\n")
+    body.append("summary:    ", style="dim")
+    body.append((match.summary.format_string or "(none)") + "\n")
+    body.append("opens app:  ", style="dim")
+    body.append(("yes" if match.open_app_when_run else "no") + "\n")
+    body.append("discover:   ", style="dim")
+    body.append(("yes" if match.is_discoverable else "no") + "\n")
+    console.print(Panel(body, title=str(match.title), border_style="cyan"))
+
+    if not match.parameters:
+        console.print("[dim](no parameters)[/dim]")
+        return
+    ptable = Table(box=SIMPLE_HEAVY, header_style="bold", title="parameters", title_justify="left")
+    ptable.add_column("name", no_wrap=True)
+    ptable.add_column("required", no_wrap=True)
+    ptable.add_column("type")
+    ptable.add_column("title", style="dim")
+    for p in match.parameters:
+        ptable.add_row(
+            p.name,
+            "yes" if not p.is_optional else "[dim]no[/dim]",
+            p.type_signature,
+            str(p.title),
+        )
+    console.print(ptable)
 
 
 def main() -> None:

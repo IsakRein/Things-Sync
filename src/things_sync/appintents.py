@@ -126,7 +126,7 @@ class Enum(_Base):
 
 class Catalog(_Base):
     bundle_path: Path
-    generator: str = ""
+    generator: dict[str, Any] = Field(default_factory=dict)
     version: str = ""
     intents: dict[str, Intent] = Field(default_factory=dict)
     entities: dict[str, Entity] = Field(default_factory=dict)
@@ -192,7 +192,7 @@ def load(bundle: Path) -> Catalog:
     }
     return Catalog(
         bundle_path=bundle,
-        generator=raw.get("generator", ""),
+        generator=raw.get("generator") or {},
         version=str(raw.get("version", "")),
         intents=intents,
         entities=entities,
