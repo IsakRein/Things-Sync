@@ -766,12 +766,14 @@ def intents_list(
     )
     table.add_column("identifier", no_wrap=True)
     table.add_column("title")
+    table.add_column("pkg", style="blue", no_wrap=True)
     table.add_column("params", justify="right", style="dim")
     table.add_column("summary", ratio=2)
     for i in items:
         table.add_row(
             i.identifier,
             str(i.title),
+            i.package,
             str(len(i.parameters)),
             i.summary.format_string or "",
         )

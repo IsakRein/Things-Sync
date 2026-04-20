@@ -37,8 +37,15 @@ def find_things_bundle() -> Path | None:
     return None
 
 
-def metadata_path(bundle: Path) -> Path:
-    return bundle / "Contents/Resources/Metadata.appintents/extract.actionsdata"
+def metadata_paths(bundle: Path) -> list[Path]:
+    """All `extract.actionsdata` files in a bundle.
+
+    Newer apps (iOS 18 / macOS 15+) use AppIntentsPackage — the top-level
+    Metadata.appintents is empty and delegates to packages inside embedded
+    frameworks (`Contents/Frameworks/*.framework/Versions/*/Resources/...`)
+    and extensions (`Contents/PlugIns/*.appex/Contents/Resources/...`).
+    """
+    return sorted(bundle.glob("**/Metadata.appintents/extract.actionsdata"))
 
 
 # ---------- models ----------
@@ -92,17 +99,17 @@ class Intent(_Base):
         alias="visibilityMetadata", default_factory=VisibilityMetadata
     )
     summary: ActionSummary = Field(default_factory=ActionSummary)
+    package: str = ""  # which embedded framework/extension it came from
 
     @classmethod
-    def from_raw(cls, raw: dict[str, Any]) -> "Intent":
-        # Pull the summary string out of the nested actionConfiguration.
+    def from_raw(cls, raw: dict[str, Any], *, package: str = "") -> "Intent":
         summary_raw: dict[str, Any] = {}
         ac = raw.get("actionConfiguration", {})
         wrapper = ac.get("actionSummary", {}).get("wrapper", {})
         s = wrapper.get("summaryString")
         if isinstance(s, dict):
             summary_raw = s
-        return cls.model_validate({**raw, "summary": summary_raw})
+        return cls.model_validate({**raw, "summary": summary_raw, "package": package})
 
 
 class Entity(_Base):
@@ -116,14 +123,31 @@ class Entity(_Base):
 
 
 class EnumCase(_Base):
-    name: str = ""
+    identifier: str = ""
     title: LocalizedString = Field(default_factory=LocalizedString)
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> "EnumCase":
+        title = raw.get("displayRepresentation", {}).get("title") or {}
+        return cls(identifier=raw.get("identifier", ""), title=LocalizedString.model_validate(title))
 
 
 class Enum(_Base):
-    type_name: str = Field(alias="typeName", default="")
+    identifier: str = ""
     fully_qualified_type_name: str = Field(alias="fullyQualifiedTypeName", default="")
+    display_type_name: LocalizedString = Field(
+        alias="displayTypeName", default_factory=LocalizedString
+    )
     cases: list[EnumCase] = Field(default_factory=list)
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> "Enum":
+        return cls(
+            identifier=raw.get("identifier", ""),
+            fullyQualifiedTypeName=raw.get("fullyQualifiedTypeName", ""),
+            displayTypeName=LocalizedString.model_validate(raw.get("displayTypeName") or {}),
+            cases=[EnumCase.from_raw(c) for c in raw.get("cases", [])],
+        )
 
 
 class Catalog(_Base):
@@ -144,6 +168,22 @@ class Catalog(_Base):
 # ---------- value-type flattening ----------
 
 
+_PRIMITIVE_NAMES = {
+    0: "String",
+    1: "Bool",
+    8: "DateTime",
+    9: "Date",
+    11: "URL",
+}
+
+
+def _primitive_kind(tid: Any) -> str | None:
+    if tid is None:
+        return None
+    name = _PRIMITIVE_NAMES.get(int(tid)) if isinstance(tid, (int, str)) and str(tid).lstrip("-").isdigit() else None
+    return name or f"Primitive({tid})"
+
+
 def describe_value_type(vt: dict[str, Any]) -> str:
     """Flatten the nested valueType tagged-union into a signature string."""
     if not isinstance(vt, dict) or not vt:
@@ -153,13 +193,23 @@ def describe_value_type(vt: dict[str, Any]) -> str:
 
     if tag == "entity":
         return f"Entity({wrapper.get('typeName', '?')})"
-    if tag == "enum":
-        return f"Enum({wrapper.get('typeName', '?')})"
+    if tag in ("enum", "linkEnumeration"):
+        return f"Enum({wrapper.get('identifier') or wrapper.get('typeName', '?')})"
     if tag == "array":
-        element = wrapper.get("elementType") or wrapper.get("valueType") or {}
+        element = (
+            wrapper.get("memberValueType")
+            or wrapper.get("elementType")
+            or wrapper.get("valueType")
+            or {}
+        )
         return f"[{describe_value_type(element)}]"
     if tag == "primitive":
-        return wrapper.get("typeName") or wrapper.get("kind") or "Primitive"
+        return (
+            wrapper.get("typeName")
+            or wrapper.get("kind")
+            or _primitive_kind(wrapper.get("typeIdentifier"))
+            or "Primitive"
+        )
     if tag == "file":
         return "File"
     if tag == "measurement":
@@ -171,31 +221,63 @@ def describe_value_type(vt: dict[str, Any]) -> str:
 # ---------- loading ----------
 
 
+def _package_name(path: Path, bundle: Path) -> str:
+    """Derive a short package label from a nested metadata path.
+
+    e.g. .../Frameworks/ThingsCommon.framework/... → "ThingsCommon"
+         .../PlugIns/ThingsWidgetExtension.appex/... → "ThingsWidgetExtension"
+         bundle top-level → "<app>"
+    """
+    rel = path.relative_to(bundle).parts
+    for part in rel:
+        if part.endswith(".framework"):
+            return part.removesuffix(".framework")
+        if part.endswith(".appex"):
+            return part.removesuffix(".appex")
+    return bundle.stem
+
+
 def load(bundle: Path) -> Catalog:
-    path = metadata_path(bundle)
-    if not path.exists():
+    paths = metadata_paths(bundle)
+    if not paths:
         raise FileNotFoundError(
-            f"No App Intents metadata at {path}. "
+            f"No App Intents metadata under {bundle}. "
             f"Either the app predates App Intents, or it wasn't built with them."
         )
-    raw = json.loads(path.read_text())
 
-    intents = {
-        ident: Intent.from_raw(a)
-        for ident, a in (raw.get("actions") or {}).items()
-    }
-    entities = {
-        name: Entity.model_validate({**e, "typeName": name})
-        for name, e in (raw.get("entities") or {}).items()
-    }
-    enums = {
-        name: Enum.model_validate({**e, "typeName": name})
-        for name, e in (raw.get("enums") or {}).items()
-    }
+    intents: dict[str, Intent] = {}
+    entities: dict[str, Entity] = {}
+    enums: dict[str, Enum] = {}
+    generator: dict[str, Any] = {}
+    version = ""
+
+    for p in paths:
+        raw = json.loads(p.read_text())
+        pkg = _package_name(p, bundle)
+        for ident, a in (raw.get("actions") or {}).items():
+            intents[ident] = Intent.from_raw(a, package=pkg)
+        # `entities` in the schema is a dict keyed by name.
+        ent_raw = raw.get("entities") or {}
+        for name, e in ent_raw.items():
+            entities[name] = Entity.model_validate({**e, "typeName": name})
+        # `enums` is a LIST of dicts in Things' schema (was dict in Excel's —
+        # Apple's tooling emits both shapes depending on SDK version).
+        enum_raw = raw.get("enums") or []
+        if isinstance(enum_raw, dict):
+            enum_raw = list(enum_raw.values())
+        for e in enum_raw:
+            en = Enum.from_raw(e)
+            if en.identifier:
+                enums[en.identifier] = en
+        if not generator:
+            generator = raw.get("generator") or {}
+        if not version:
+            version = str(raw.get("version", ""))
+
     return Catalog(
         bundle_path=bundle,
-        generator=raw.get("generator") or {},
-        version=str(raw.get("version", "")),
+        generator=generator,
+        version=version,
         intents=intents,
         entities=entities,
         enums=enums,
