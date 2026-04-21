@@ -43,7 +43,25 @@ things update <uuid> [...]         # Edit fields
 things open <uuid>                 # Open in Things.app via the things:// URL scheme
 things doctor                      # Verify SQLite + Cloud credentials
 things pull                        # Touch the Cloud to refresh state cache
+
+# App Intents back door (things the Cloud API can't do, e.g. hard delete)
+things intents list                # Show all 15 Things App Intents
+things shortcut setup              # Print the one-time wrapper-shortcut recipe
+things shortcut list [--things]    # List installed shortcuts
+things shortcut run <name>         # Invoke a shortcut headlessly
+things trash-hard <uuid>           # Permanently delete via `ts-delete` wrapper
 ```
+
+## App Intents back door
+
+Things exposes 15 App Intents (`things intents list`) — including
+`TAIDeleteItems` with `deleteImmediately=true`, which the Cloud protocol
+has no equivalent for. We can't call App Intents directly from Python
+(AMFI blocks `com.apple.shortcuts.background-running` for non-Apple
+binaries), so the tool shells out to `/usr/bin/shortcuts run` against
+user-authored wrapper Shortcuts. Build them once via Shortcuts.app —
+`things shortcut setup` prints the recipe. Convention: wrappers are
+named with the `ts-` prefix.
 
 ## Auth
 
