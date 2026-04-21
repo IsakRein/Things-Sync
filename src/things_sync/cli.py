@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from . import appintents, cloud
+from . import appintents, cloud, shortcut as shortcut_mod
 from .db import DEFAULT_DB_PATH, GROUP_CONTAINER, ThingsDB
 from .models import STATUS_COMPLETED, Task
 
@@ -831,6 +831,108 @@ def intents_show(
             str(p.title),
         )
     console.print(ptable)
+
+
+shortcut_app = typer.Typer(
+    name="shortcut",
+    help="Back-door into Things via wrapper Shortcuts (App Intents).",
+    no_args_is_help=True,
+)
+app.add_typer(shortcut_app)
+
+
+@shortcut_app.command("setup")
+def shortcut_setup() -> None:
+    """Print the one-time wrapper-shortcut build recipe."""
+    console.print(shortcut_mod.SETUP_INSTRUCTIONS)
+
+
+@shortcut_app.command("list")
+def shortcut_list(
+    only_things: bool = typer.Option(
+        False, "--things", help="Only show shortcuts bound to Things.app."
+    ),
+    only_prefix: bool = typer.Option(
+        False,
+        "--prefix",
+        help=f"Only show wrappers with the configured prefix ({shortcut_mod.SHORTCUT_PREFIX!r}).",
+    ),
+) -> None:
+    """List installed shortcuts."""
+    items = shortcut_mod.describe_all()
+    if only_things:
+        items = [i for i in items if i.associated_bundle_id == shortcut_mod.THINGS_BUNDLE_ID]
+    if only_prefix:
+        items = [i for i in items if i.name.startswith(shortcut_mod.SHORTCUT_PREFIX)]
+
+    if not items:
+        console.print("[dim]No shortcuts found.[/dim]")
+        return
+
+    table = Table(
+        title=f"[bold]Shortcuts[/bold]  [dim]({len(items)})[/dim]",
+        title_justify="left",
+        box=SIMPLE_HEAVY,
+        header_style="bold",
+        expand=True,
+    )
+    table.add_column("name", no_wrap=False)
+    table.add_column("bound app", style="blue", no_wrap=True)
+    table.add_column("actions", style="dim")
+    for s in items:
+        table.add_row(
+            s.name,
+            (s.associated_bundle_id or "").removeprefix("com.culturedcode.") or "",
+            s.actions_description or "",
+        )
+    console.print(table)
+
+
+@shortcut_app.command("run")
+def shortcut_run(
+    name: str = typer.Argument(..., help="Shortcut name (exact)."),
+    input_text: str = typer.Option("", "--input", "-i", help="Text to pipe as Shortcut Input."),
+    no_output: bool = typer.Option(False, "--no-output", help="Don't request output."),
+) -> None:
+    """Run a shortcut by name and print its output."""
+    try:
+        out = shortcut_mod.run(
+            name,
+            input_text=input_text or None,
+            output_type=None if no_output else "public.plain-text",
+        )
+    except shortcut_mod.ShortcutError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if out:
+        console.print(out)
+    else:
+        console.print(f"[green]✓[/green] ran {name!r}")
+
+
+@app.command("trash-hard")
+def trash_hard(
+    uuid: str = typer.Argument(..., help="Task uuid or prefix."),
+    soft: bool = typer.Option(False, "--soft", help="Route through Trash (not immediate)."),
+) -> None:
+    """Delete a to-do permanently via the `ts-delete` wrapper shortcut.
+
+    The Cloud protocol has no 'delete immediately' verb — only trash. This
+    goes through the `TAIDeleteItems` App Intent's `deleteImmediately=true`
+    path, wrapped as a Shortcut. Run `things shortcut setup` first.
+    """
+    full = _resolve_full_uuid(uuid)
+    try:
+        shortcut_mod.delete_todo(full, immediate=not soft)
+    except shortcut_mod.ShortcutNotInstalled as exc:
+        err.print(f"[red]{exc}[/red]")
+        err.print("[dim]Run `things shortcut setup` for the recipe.[/dim]")
+        raise typer.Exit(1)
+    except shortcut_mod.ShortcutError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    mark = "💥" if not soft else "🗑"
+    console.print(f"[red]{mark}[/red] deleted {full}")
 
 
 def main() -> None:
