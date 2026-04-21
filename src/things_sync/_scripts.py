@@ -50,17 +50,6 @@ on parseISO(s)
     return d
 end parseISO
 
-on safeGet(obj, propName)
-    try
-        if propName is "project" then return id of (project of obj)
-        if propName is "area" then return id of (area of obj)
-        if propName is "contact" then return id of (contact of obj)
-        if propName is "parentTag" then return id of (parent tag of obj)
-    on error
-        return ""
-    end try
-    return ""
-end safeGet
 """
 
 

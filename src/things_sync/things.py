@@ -18,7 +18,7 @@ class _Sentinel(Enum):
     UNSET = object()
 
 
-UNSET = UNSET
+UNSET = _Sentinel.UNSET
 
 
 def _to_date_arg(v: date | datetime | str | None) -> str:
@@ -367,18 +367,16 @@ class Things:
             props.append(f"tag names:{as_str(_csv_tags(tags))}")
         record = "{" + ", ".join(props) + "}"
 
-        location = ""
-        if area is not None:
-            location = f" at end of projects of area id {as_str(area)}"
-
         post = []
+        if area is not None:
+            post.append(f"set area of p to area id {as_str(area)}")
         if when is not None:
             post.append(f"schedule p for {_to_date_arg(when)}")
 
         post_block = "\n            ".join(post)
         body = f"""
         tell {TELL}
-            set p to make new project with properties {record}{location}
+            set p to make new project with properties {record}
             {post_block}
             return my serializeProject(p)
         end tell
