@@ -5,16 +5,10 @@ description = "AppleScript-backed wrapper for Things 3: full CRUD over to-dos, p
 readme = "README.md"
 requires-python = ">=3.13"
 authors = [{ name = "Isak Reinholdsson", email = "isak@isak.io" }]
-dependencies = [
-    "rich>=15.0.0",
-    "typer>=0.24.1",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0"]
-
-[project.scripts]
-things = "things_sync.cli:app"
 
 [build-system]
 requires = ["hatchling"]

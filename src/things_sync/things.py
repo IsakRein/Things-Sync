@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Iterable
 
 from . import _osascript as osa
-from ._osascript import US, RS, as_str, as_date, parse_iso, parse_records
+from ._osascript import US, as_date, as_str, parse_iso, parse_records
 from ._scripts import script
 from .models import Area, Contact, ListInfo, Project, Status, Tag, Todo
 
