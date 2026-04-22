@@ -1,8 +1,10 @@
 # things-sync
 
-AppleScript-backed Python wrapper for Things 3. Full CRUD over to-dos,
-projects, areas, tags, and contacts via the Things scripting dictionary —
-no Cloud HTTP, no reverse-engineered protocols, no Shortcuts wrappers.
+Python wrapper for Things 3. Full CRUD over to-dos, projects, areas,
+tags, and contacts via the Things scripting dictionary — no Cloud HTTP,
+no reverse-engineered protocols, no Shortcuts wrappers. A separate
+read-only SQLite reader handles bulk enumeration at disk speed for
+sync-planning and reporting workloads.
 
 Mac only. Things 3 must be installed.
 
@@ -72,6 +74,29 @@ on every create / read).
 `is_running`.
 
 **Maintenance.** `log_completed_now`.
+
+## Fast reads (`ThingsDB`)
+
+AppleScript enumeration is dominated by per-property IPC roundtrips —
+reading every todo with all fields can take seconds per hundred items.
+`ThingsDB` skips AppleScript entirely and reads Things' on-disk SQLite
+file directly. Same dataclasses, same fields, 100–1000× faster:
+
+```python
+from things_sync import ThingsDB, Status
+
+db = ThingsDB()                      # autodetects ~/Library/Group Containers/…
+open_todos = [t for t in db.todos() if t.status == Status.OPEN]
+projects   = db.projects()
+areas      = db.areas()
+tags       = db.tags()
+```
+
+Reads only. Writes must still go through `Things()` — poking the SQLite
+file directly would desynchronise Things' in-memory state and its
+CloudKit sync. The DB is WAL-mode so reading while the app is running is
+safe. Pass `ThingsDB(path=…)` if your install lives in a non-standard
+container.
 
 ## Models
 
