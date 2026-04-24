@@ -11,6 +11,12 @@ class Status(str, Enum):
     CANCELED = "canceled"
 
 
+class StartBucket(int, Enum):
+    INBOX = 0
+    ANYTIME = 1
+    SOMEDAY = 2
+
+
 @dataclass(frozen=True)
 class Todo:
     id: str
@@ -27,6 +33,7 @@ class Todo:
     project_id: str | None = None
     area_id: str | None = None
     contact_id: str | None = None
+    start_bucket: StartBucket = StartBucket.ANYTIME
 
 
 @dataclass(frozen=True)

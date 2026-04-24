@@ -24,7 +24,7 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
-from .models import Area, Project, Status, Tag, Todo
+from .models import Area, Project, StartBucket, Status, Tag, Todo
 
 
 _DB_GLOB = (
@@ -77,6 +77,19 @@ def _decode_packed_date(v: int | None) -> datetime | None:
         return datetime(y, m, d)
     except ValueError:
         return None
+
+
+def _start_bucket(v: int | None) -> StartBucket:
+    """Map TMTask.start (0/1/2) onto the StartBucket enum.
+
+    Unexpected values fall through to ANYTIME — Things' internal schema has
+    historically grown new codes, and leaving a foreign value unpinned would
+    crash every reader the next time Cultured Code ships one.
+    """
+    try:
+        return StartBucket(v)
+    except ValueError:
+        return StartBucket.ANYTIME
 
 
 def _from_unix(v: float | None) -> datetime | None:
@@ -171,7 +184,7 @@ class ThingsDB:
         sql = """
             SELECT uuid, title, notes, status, trashed,
                    creationDate, userModificationDate, stopDate,
-                   startDate, deadline,
+                   start, startDate, deadline,
                    project, area, contact
             FROM TMTask
             WHERE type = ?
@@ -223,6 +236,7 @@ def _todo_from_row(r: sqlite3.Row, tags_by_task: dict[str, tuple[str, ...]]) -> 
         project_id=r["project"] or None,
         area_id=r["area"] or None,
         contact_id=r["contact"] or None,
+        start_bucket=_start_bucket(r["start"]),
     )
 
 
