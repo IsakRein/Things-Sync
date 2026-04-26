@@ -114,6 +114,30 @@ def _default_xx() -> dict[str, Any]:
     return {"_t": "oo", "sn": {}}
 
 
+def _validate_uuids(label: str, uuids: Iterable[str]) -> list[str]:
+    """Reject anything that isn't a Base58-shaped 21-22 char UUID.
+
+    Pushing a non-UUID where Things expects one (e.g. a tag *name* in the
+    ``tg`` field) crashes every device that pulls the commit, because the
+    Base58 decoder asserts on out-of-alphabet characters. This guards the
+    ``add_*`` / ``edit`` API surface; callers must resolve names to
+    UUIDs themselves (e.g. via :class:`ThingsDB`).
+    """
+    out: list[str] = []
+    for u in uuids:
+        if not isinstance(u, str) or not (21 <= len(u) <= 22):
+            raise ValueError(
+                f"{label}: expected a Things UUID (21-22 base58 chars), got {u!r}"
+            )
+        if any(c not in _ALPHABET for c in u):
+            raise ValueError(
+                f"{label}: {u!r} contains non-base58 character — looks like a name, "
+                f"not a UUID. Resolve names to UUIDs before passing them to ThingsCloud."
+            )
+        out.append(u)
+    return out
+
+
 def _build_payload(
     *,
     title: str,
@@ -134,6 +158,11 @@ def _build_payload(
     """
     if destination is None:
         destination = DEST_ANYTIME if (project_uuid or area_uuid or when_ts or tp != TYPE_TASK) else DEST_INBOX
+    refs = []
+    if project_uuid: refs.extend(_validate_uuids("project_uuid", [project_uuid]))
+    if area_uuid:    refs.extend(_validate_uuids("area_uuid", [area_uuid]))
+    if heading_uuid: refs.extend(_validate_uuids("heading_uuid", [heading_uuid]))
+    tag_uuids = _validate_uuids("tags", tags) if tags else []
     now = _now_ts()
     return {
         "ix": 0,
@@ -162,7 +191,7 @@ def _build_payload(
         "pr": [project_uuid] if project_uuid else [],
         "ar": [area_uuid] if area_uuid else [],
         "agr": [heading_uuid] if heading_uuid else [],
-        "tg": list(tags),
+        "tg": tag_uuids,
         "rt": [],
         "rmd": None,
         "dl": [],
@@ -501,13 +530,13 @@ class ThingsCloud:
         if trashed is not None:
             delta["tr"] = trashed
         if project is not False:
-            delta["pr"] = [project] if project else []
+            delta["pr"] = _validate_uuids("project", [project]) if project else []
         if area is not False:
-            delta["ar"] = [area] if area else []
+            delta["ar"] = _validate_uuids("area", [area]) if area else []
         if heading is not False:
-            delta["agr"] = [heading] if heading else []
+            delta["agr"] = _validate_uuids("heading", [heading]) if heading else []
         if tags is not None:
-            delta["tg"] = list(tags)
+            delta["tg"] = _validate_uuids("tags", tags)
         if index is not None:
             delta["ix"] = index
         if not delta:

@@ -72,6 +72,12 @@ def _to_dt(v: date | datetime | str | None) -> datetime | None:
     return datetime(v.year, v.month, v.day)
 
 
+def _looks_like_uuid(s: str) -> bool:
+    """Heuristic: 21-22 chars, all alphanumeric. Used to distinguish a tag
+    UUID from a tag name when we accept either at the API surface."""
+    return 21 <= len(s) <= 22 and s.isalnum()
+
+
 class Things:
     """Façade exposing Things' state and ops with sensible per-op routing.
 
@@ -110,6 +116,30 @@ class Things:
         if self._db is None:
             self._db = ThingsDB()
         return self._db
+
+    def _resolve_tags(self, tags: Iterable[str] | None) -> list[str]:
+        """Map tag names → tag UUIDs using the local DB. UUIDs pass through.
+
+        Cloud commits expect ``tg: [<uuid>, ...]``; the public API has
+        always taken names because that matched the AppleScript surface.
+        Anything that doesn't already look like a UUID gets resolved by
+        a name lookup against ``ThingsDB.tag(name)``.
+        """
+        if not tags:
+            return []
+        out = []
+        for t in tags:
+            if _looks_like_uuid(t):
+                out.append(t)
+                continue
+            tag = self.db.tag(t)
+            if tag is None:
+                raise ValueError(
+                    f"Tag {t!r} not found in local DB — create it (via "
+                    f"create_tag) or pass its UUID directly."
+                )
+            out.append(tag.id)
+        return out
 
     # ------------------------------------------------------------------ meta
 
@@ -274,10 +304,11 @@ class Things:
                 "Cloud wire format for contact assignment isn't captured yet — "
                 "create the todo first, then attach via AppleScript if needed."
             )
+        tag_uuids = self._resolve_tags(tags)
         uuid = self.cloud.add_todo(
             name, notes=notes or "", when=when, deadline=deadline,
             project=project, area=area, heading=heading,
-            tags=tags or (),
+            tags=tag_uuids,
         )
         self._settle(uuid)
         now = datetime.now()
@@ -301,8 +332,9 @@ class Things:
         tags: Iterable[str] | None = None,
         area: str | None = None,
     ) -> Project:
+        tag_uuids = self._resolve_tags(tags)
         uuid = self.cloud.add_project(
-            name, notes=notes or "", deadline=deadline, area=area, tags=tags or (),
+            name, notes=notes or "", deadline=deadline, area=area, tags=tag_uuids,
         )
         # Cloud has no `when` arg on create — schedule afterward if requested.
         if when is not None:
@@ -410,7 +442,7 @@ class Things:
         if due_date is not UNSET:
             kwargs["deadline"] = due_date
         if tags is not None:
-            kwargs["tags"] = list(tags)
+            kwargs["tags"] = self._resolve_tags(tags)
         if status is not None:
             kwargs["status"] = _STATUS_TO_CLOUD[status]
         if project is not UNSET:
@@ -445,7 +477,7 @@ class Things:
         if due_date is not UNSET:
             kwargs["deadline"] = due_date
         if tags is not None:
-            kwargs["tags"] = list(tags)
+            kwargs["tags"] = self._resolve_tags(tags)
         if status is not None:
             kwargs["status"] = _STATUS_TO_CLOUD[status]
         if area is not UNSET:
