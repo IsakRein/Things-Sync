@@ -80,6 +80,11 @@ def _decode_packed_date(v: int | None) -> datetime | None:
         return None
 
 
+def _encode_packed_date(d) -> int:
+    """Inverse of :func:`_decode_packed_date`. Accepts a date or datetime."""
+    return (d.year << 16) | (d.month << 12) | (d.day << 7)
+
+
 def _start_bucket(v: int | None) -> StartBucket:
     """Map TMTask.start (0/1/2) onto the StartBucket enum.
 
@@ -290,6 +295,86 @@ class ThingsDB:
 
     def todos_under_heading(self, heading_id: str, *, include_trashed: bool = False) -> list[Todo]:
         return self._tasks_filtered(_TYPE_TODO, "heading=?", (heading_id,), include_trashed)
+
+    def todos_in_list(self, name: str) -> list[Todo]:
+        """Built-in virtual list — Things derives these from TMTask columns
+        rather than storing them. The AppleScript ``to dos of list "X"``
+        path is broken in Things 3.22.11 (returns -1728), so we
+        re-implement the derivation against SQLite.
+
+        Supported names (case-insensitive): Inbox, Today, Upcoming,
+        Anytime, Someday, Logbook, Trash. Heuristic but matches the UI
+        for the cases atlas cares about.
+        """
+        from datetime import date as _date
+
+        n = name.lower()
+        today = _encode_packed_date(_date.today())
+
+        # base SELECT shared by all branches
+        cols = (
+            'uuid, title, notes, status, trashed, '
+            'creationDate, userModificationDate, stopDate, '
+            'start, startDate, deadline, '
+            'project, area, contact, heading'
+        )
+        if n == "trash":
+            sql = f'SELECT {cols} FROM TMTask WHERE trashed=1 AND type=? ORDER BY "index"'
+            params: tuple = (_TYPE_TODO,)
+        elif n == "logbook":
+            sql = (
+                f'SELECT {cols} FROM TMTask '
+                'WHERE type=? AND trashed=0 AND status IN (2, 3) ORDER BY stopDate DESC'
+            )
+            params = (_TYPE_TODO,)
+        elif n == "inbox":
+            sql = (
+                f'SELECT {cols} FROM TMTask '
+                'WHERE type=? AND trashed=0 AND status=0 AND start=0 ORDER BY "index"'
+            )
+            params = (_TYPE_TODO,)
+        elif n == "today":
+            # Today = open + scheduled-and-arrived. Includes pinned via
+            # todayIndexReferenceDate but leaving that for atlas to refine.
+            sql = (
+                f'SELECT {cols} FROM TMTask '
+                'WHERE type=? AND trashed=0 AND status=0 '
+                'AND startDate IS NOT NULL AND startDate <= ? '
+                'ORDER BY todayIndex'
+            )
+            params = (_TYPE_TODO, today)
+        elif n == "upcoming":
+            sql = (
+                f'SELECT {cols} FROM TMTask '
+                'WHERE type=? AND trashed=0 AND status=0 '
+                'AND startDate IS NOT NULL AND startDate > ? '
+                'ORDER BY startDate, "index"'
+            )
+            params = (_TYPE_TODO, today)
+        elif n == "anytime":
+            # Active items in the Anytime bucket without a future schedule.
+            sql = (
+                f'SELECT {cols} FROM TMTask '
+                'WHERE type=? AND trashed=0 AND status=0 AND start=1 '
+                'AND (startDate IS NULL OR startDate <= ?) ORDER BY "index"'
+            )
+            params = (_TYPE_TODO, today)
+        elif n == "someday":
+            sql = (
+                f'SELECT {cols} FROM TMTask '
+                'WHERE type=? AND trashed=0 AND status=0 AND start=2 ORDER BY "index"'
+            )
+            params = (_TYPE_TODO,)
+        else:
+            raise ValueError(
+                f"unknown built-in list {name!r}; expected one of "
+                "Inbox, Today, Upcoming, Anytime, Someday, Logbook, Trash"
+            )
+
+        with closing(self._connect()) as con:
+            rows = con.execute(sql, params).fetchall()
+            tags_by_task = _tags_by_owner(con, "TMTaskTag", "tasks")
+        return [_todo_from_row(r, tags_by_task) for r in rows]
 
     def todos_with_tag(self, name: str, *, include_trashed: bool = False) -> list[Todo]:
         sql = """

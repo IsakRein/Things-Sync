@@ -25,6 +25,9 @@ from typing import Iterable
 
 from . import _osascript as osa
 from ._cloud import (
+    DEST_ANYTIME as _DEST_ANYTIME,
+    DEST_INBOX as _DEST_INBOX,
+    DEST_SOMEDAY as _DEST_SOMEDAY,
     STATUS_CANCELLED as _CLOUD_STATUS_CANCELLED,
     STATUS_COMPLETE as _CLOUD_STATUS_COMPLETE,
     STATUS_OPEN as _CLOUD_STATUS_OPEN,
@@ -183,24 +186,10 @@ class Things:
         return self.db.headings()
 
     def lists(self) -> list[ListInfo]:
-        """Built-in lists (Inbox/Today/etc) — virtual, queried via AS."""
-        body = f"""
-        tell {TELL}
-            set out to ""
-            repeat with l in lists
-                if out is "" then
-                    set out to my serializeList(l)
-                else
-                    set out to out & RS & my serializeList(l)
-                end if
-            end repeat
-            return out
-        end tell
-        """
-        return [
-            ListInfo(id=r[0], name=r[1])
-            for r in parse_records(osa.run(script(body)))
-        ]
+        """Built-in lists. The ids are stable identifiers Things uses
+        internally; we return them by name since the AS ``lists``
+        collection is broken on Things 3.22.11."""
+        return [ListInfo(id=name, name=name) for name in BUILTIN_LISTS]
 
     # ------------------------------------------------------- by-id reads (DB)
 
@@ -228,26 +217,10 @@ class Things:
         return self.db.todos_with_tag(name)
 
     def todos_in_list(self, name: str) -> list[Todo]:
-        """Built-in lists (Inbox/Today/Trash etc.) — virtual, queried via AS.
-
-        These categories aren't first-class columns in TMTask; Things
-        derives them from `start`, `startDate`, `status`, and `trashed`.
-        Rather than re-implement that derivation we ask Things directly.
-        """
-        body = f"""
-        tell {TELL}
-            set out to ""
-            repeat with t in to dos of list {as_str(name)}
-                if out is "" then
-                    set out to my serializeTodo(t)
-                else
-                    set out to out & RS & my serializeTodo(t)
-                end if
-            end repeat
-            return out
-        end tell
-        """
-        return [_parse_todo(r) for r in parse_records(osa.run(script(body)))]
+        """Items in a built-in list (Inbox/Today/Upcoming/Anytime/Someday/
+        Logbook/Trash). Derived from TMTask columns since the AS list
+        path is broken on Things 3.22.11."""
+        return self.db.todos_in_list(name)
 
     def selected_todos(self) -> list[Todo]:
         """Currently-selected todos in Things UI — only available via AS."""
@@ -569,13 +542,46 @@ class Things:
         return self._effective_todo(id, status=Status.OPEN, _reopen=True)
 
     def move_to_list(self, id: str, list_name: str) -> None:
-        """Move a todo to a built-in list — done via AS (lists are virtual)."""
-        body = f"""
-        tell {TELL}
-            move (to do id {as_str(id)}) to list {as_str(list_name)}
-        end tell
+        """Move a todo to a built-in list via Cloud verbs.
+
+        The lists are virtual — there's no list to "move" to, so we
+        translate to the canonical operation:
+
+        - Inbox: clear project/area/heading, set destination=INBOX
+        - Today: schedule for today (sr=today; UI shows it under Today)
+        - Anytime: clear schedule, destination=ANYTIME
+        - Someday: destination=SOMEDAY
+        - Logbook: complete (Things archives completed items there)
+        - Trash: trash
+
+        ``Upcoming`` isn't a destination — it's auto-derived from a future
+        schedule date — so use :meth:`schedule` directly with that date.
         """
-        osa.run(script(body))
+        n = list_name.lower()
+        if n == "inbox":
+            self.cloud.edit(id, project=None, area=None, heading=None,
+                            destination=_DEST_INBOX)
+        elif n == "today":
+            self.cloud.edit(id, when=date.today())
+        elif n == "anytime":
+            self.cloud.edit(id, when=None, destination=_DEST_ANYTIME)
+        elif n == "someday":
+            self.cloud.edit(id, destination=_DEST_SOMEDAY)
+        elif n == "trash":
+            self.cloud.trash(id)
+        elif n == "logbook":
+            self.cloud.complete(id)
+        elif n == "upcoming":
+            raise ValueError(
+                "Upcoming is derived from a future scheduled date; use "
+                "Things.schedule(id, future_date) instead."
+            )
+        else:
+            raise ValueError(
+                f"unknown list {list_name!r}; expected Inbox/Today/Anytime/"
+                "Someday/Logbook/Trash"
+            )
+        self._settle(id)
 
     def move_to_area(self, id: str, area_id: str) -> None:
         self.cloud.edit(id, area=area_id)

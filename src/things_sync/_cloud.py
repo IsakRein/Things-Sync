@@ -504,6 +504,7 @@ class ThingsCloud:
         heading: str | None | bool = False,
         tags: Iterable[str] | None = None,
         index: int | None = None,
+        destination: int | None = None,
     ) -> int:
         """Patch a Task6 entity (todo, project, or heading).
 
@@ -539,6 +540,8 @@ class ThingsCloud:
             delta["tg"] = _validate_uuids("tags", tags)
         if index is not None:
             delta["ix"] = index
+        if destination is not None:
+            delta["st"] = destination
         if not delta:
             raise ValueError("edit called with no fields to change")
         return self.commit(uuid, {"t": UPDATE_EDIT, "e": "Task6", "p": _build_edit(delta)})
