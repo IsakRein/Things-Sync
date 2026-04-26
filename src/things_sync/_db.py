@@ -24,7 +24,7 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
-from .models import Area, Heading, Project, StartBucket, Status, Tag, Todo
+from .models import Area, Contact, Heading, Project, StartBucket, Status, Tag, Todo
 
 
 _DB_GLOB = (
@@ -206,7 +206,180 @@ class ThingsDB:
             for r in rows
         ]
 
+    def contacts(self) -> list[Contact]:
+        with closing(self._connect()) as con:
+            rows = con.execute(
+                'SELECT uuid, displayName FROM TMContact ORDER BY "index"'
+            ).fetchall()
+        return [Contact(id=r["uuid"], name=r["displayName"] or "") for r in rows]
+
+    # --------------------------------------------------------- by-id lookups
+
+    def todo(self, id: str, *, include_trashed: bool = True) -> Todo | None:
+        return self._task_by_id(id, _TYPE_TODO, include_trashed, _todo_from_row)
+
+    def project(self, id: str, *, include_trashed: bool = True) -> Project | None:
+        return self._task_by_id(id, _TYPE_PROJECT, include_trashed, _project_from_row)
+
+    def heading(self, id: str, *, include_trashed: bool = True) -> Heading | None:
+        sql = "SELECT uuid, title, status, project FROM TMTask WHERE uuid=? AND type=?"
+        if not include_trashed:
+            sql += " AND trashed=0"
+        with closing(self._connect()) as con:
+            r = con.execute(sql, (id, _TYPE_HEADING)).fetchone()
+        if r is None:
+            return None
+        return Heading(
+            id=r["uuid"],
+            name=r["title"] or "",
+            project_id=r["project"] or None,
+            status=_STATUS_BY_INT.get(r["status"], Status.OPEN),
+        )
+
+    def area(self, id: str) -> Area | None:
+        with closing(self._connect()) as con:
+            r = con.execute(
+                "SELECT uuid, title FROM TMArea WHERE uuid=?", (id,)
+            ).fetchone()
+            tags_by_owner = _tags_by_owner(con, "TMAreaTag", "areas")
+        if r is None:
+            return None
+        return Area(
+            id=r["uuid"],
+            name=r["title"] or "",
+            tag_names=tags_by_owner.get(r["uuid"], ()),
+            collapsed=False,
+        )
+
+    def tag(self, name: str) -> Tag | None:
+        """Look up by display name (Things tags are name-unique)."""
+        with closing(self._connect()) as con:
+            r = con.execute(
+                'SELECT uuid, title, shortcut, parent FROM TMTag WHERE title=?', (name,)
+            ).fetchone()
+        if r is None:
+            return None
+        return Tag(
+            id=r["uuid"],
+            name=r["title"] or "",
+            parent_id=r["parent"] or None,
+            keyboard_shortcut=r["shortcut"] or "",
+        )
+
+    def tag_by_id(self, id: str) -> Tag | None:
+        with closing(self._connect()) as con:
+            r = con.execute(
+                'SELECT uuid, title, shortcut, parent FROM TMTag WHERE uuid=?', (id,)
+            ).fetchone()
+        if r is None:
+            return None
+        return Tag(
+            id=r["uuid"],
+            name=r["title"] or "",
+            parent_id=r["parent"] or None,
+            keyboard_shortcut=r["shortcut"] or "",
+        )
+
+    # ------------------------------------------------------- filtered todos
+
+    def todos_in_project(self, project_id: str, *, include_trashed: bool = False) -> list[Todo]:
+        return self._tasks_filtered(_TYPE_TODO, "project=?", (project_id,), include_trashed)
+
+    def todos_in_area(self, area_id: str, *, include_trashed: bool = False) -> list[Todo]:
+        return self._tasks_filtered(_TYPE_TODO, "area=?", (area_id,), include_trashed)
+
+    def todos_under_heading(self, heading_id: str, *, include_trashed: bool = False) -> list[Todo]:
+        return self._tasks_filtered(_TYPE_TODO, "heading=?", (heading_id,), include_trashed)
+
+    def todos_with_tag(self, name: str, *, include_trashed: bool = False) -> list[Todo]:
+        sql = """
+            SELECT TMTask.uuid AS uuid, title, notes, status, trashed,
+                   creationDate, userModificationDate, stopDate,
+                   start, startDate, deadline,
+                   project, area, contact, heading
+            FROM TMTask
+            JOIN TMTaskTag ON TMTaskTag.tasks = TMTask.uuid
+            JOIN TMTag ON TMTag.uuid = TMTaskTag.tags
+            WHERE TMTask.type = ? AND TMTag.title = ?
+        """
+        if not include_trashed:
+            sql += " AND TMTask.trashed = 0"
+        sql += ' ORDER BY TMTask."index"'
+        with closing(self._connect()) as con:
+            rows = con.execute(sql, (_TYPE_TODO, name)).fetchall()
+            tags_by_task = _tags_by_owner(con, "TMTaskTag", "tasks")
+        return [_todo_from_row(r, tags_by_task) for r in rows]
+
+    # --------------------------------------------------------- counts / exists
+
+    def count_todos(self, *, include_trashed: bool = False) -> int:
+        return self._count(_TYPE_TODO, include_trashed)
+
+    def count_projects(self, *, include_trashed: bool = False) -> int:
+        return self._count(_TYPE_PROJECT, include_trashed)
+
+    def count_areas(self) -> int:
+        with closing(self._connect()) as con:
+            return con.execute("SELECT COUNT(*) FROM TMArea").fetchone()[0]
+
+    def count_tags(self) -> int:
+        with closing(self._connect()) as con:
+            return con.execute("SELECT COUNT(*) FROM TMTag").fetchone()[0]
+
+    def exists(self, id: str) -> bool:
+        with closing(self._connect()) as con:
+            for sql, params in (
+                ("SELECT 1 FROM TMTask WHERE uuid=? LIMIT 1", (id,)),
+                ("SELECT 1 FROM TMArea WHERE uuid=? LIMIT 1", (id,)),
+                ("SELECT 1 FROM TMTag WHERE uuid=? LIMIT 1", (id,)),
+            ):
+                if con.execute(sql, params).fetchone() is not None:
+                    return True
+        return False
+
     # ---------------------------------------------------------- task helpers
+
+    def _task_by_id(self, id: str, type_: int, include_trashed: bool, parse):
+        sql = """
+            SELECT uuid, title, notes, status, trashed,
+                   creationDate, userModificationDate, stopDate,
+                   start, startDate, deadline,
+                   project, area, contact, heading
+            FROM TMTask
+            WHERE uuid=? AND type=?
+        """
+        if not include_trashed:
+            sql += " AND trashed=0"
+        with closing(self._connect()) as con:
+            row = con.execute(sql, (id, type_)).fetchone()
+            if row is None:
+                return None
+            tags_by_task = _tags_by_owner(con, "TMTaskTag", "tasks")
+        return parse(row, tags_by_task)
+
+    def _tasks_filtered(self, type_: int, where: str, params: tuple, include_trashed: bool) -> list:
+        sql = f"""
+            SELECT uuid, title, notes, status, trashed,
+                   creationDate, userModificationDate, stopDate,
+                   start, startDate, deadline,
+                   project, area, contact, heading
+            FROM TMTask
+            WHERE type = ? AND {where}
+        """
+        if not include_trashed:
+            sql += " AND trashed = 0"
+        sql += ' ORDER BY "index"'
+        with closing(self._connect()) as con:
+            rows = con.execute(sql, (type_, *params)).fetchall()
+            tags_by_task = _tags_by_owner(con, "TMTaskTag", "tasks")
+        return [_todo_from_row(r, tags_by_task) for r in rows]
+
+    def _count(self, type_: int, include_trashed: bool) -> int:
+        sql = "SELECT COUNT(*) FROM TMTask WHERE type = ?"
+        if not include_trashed:
+            sql += " AND trashed = 0"
+        with closing(self._connect()) as con:
+            return con.execute(sql, (type_,)).fetchone()[0]
 
     def _tasks(self, type_: int, include_trashed: bool, parse) -> list:
         sql = """
