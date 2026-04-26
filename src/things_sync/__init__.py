@@ -1,5 +1,5 @@
 from ._db import ThingsDB
-from .models import Area, Contact, ListInfo, Project, StartBucket, Status, Tag, Todo
+from .models import Area, Contact, Heading, ListInfo, Project, StartBucket, Status, Tag, Todo
 from .things import Things
 
 __all__ = [
@@ -8,6 +8,7 @@ __all__ = [
     "Todo",
     "Project",
     "Area",
+    "Heading",
     "Tag",
     "Contact",
     "ListInfo",

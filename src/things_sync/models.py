@@ -33,6 +33,7 @@ class Todo:
     project_id: str | None = None
     area_id: str | None = None
     contact_id: str | None = None
+    heading_id: str | None = None
     start_bucket: StartBucket = StartBucket.ANYTIME
 
 
@@ -58,6 +59,14 @@ class Area:
     name: str
     tag_names: tuple[str, ...] = ()
     collapsed: bool = False
+
+
+@dataclass(frozen=True)
+class Heading:
+    id: str
+    name: str
+    project_id: str | None = None
+    status: Status = Status.OPEN
 
 
 @dataclass(frozen=True)

@@ -24,7 +24,7 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
-from .models import Area, Project, StartBucket, Status, Tag, Todo
+from .models import Area, Heading, Project, StartBucket, Status, Tag, Todo
 
 
 _DB_GLOB = (
@@ -35,6 +35,7 @@ _DB_GLOB = (
 # TMTask.type
 _TYPE_TODO = 0
 _TYPE_PROJECT = 1
+_TYPE_HEADING = 2
 
 # TMTask.status — the ints Things uses on disk, distinct from our Status enum.
 _STATUS_BY_INT = {0: Status.OPEN, 2: Status.CANCELED, 3: Status.COMPLETED}
@@ -144,6 +145,33 @@ class ThingsDB:
         """Every non-trashed project (type=1), any status."""
         return self._tasks(_TYPE_PROJECT, include_trashed, _project_from_row)
 
+    def headings(self, *, include_trashed: bool = False) -> list[Heading]:
+        """Every non-trashed heading (type=2), any status.
+
+        A heading lives inside a project; its ``project_id`` is the parent
+        project's UUID. Todos under a heading reference it via their
+        ``heading`` column (exposed on :class:`Todo` as ``heading_id``).
+        """
+        sql = """
+            SELECT uuid, title, status, project
+            FROM TMTask
+            WHERE type = ?
+        """
+        if not include_trashed:
+            sql += " AND trashed = 0"
+        sql += ' ORDER BY "index"'
+        with closing(self._connect()) as con:
+            rows = con.execute(sql, (_TYPE_HEADING,)).fetchall()
+        return [
+            Heading(
+                id=r["uuid"],
+                name=r["title"] or "",
+                project_id=r["project"] or None,
+                status=_STATUS_BY_INT.get(r["status"], Status.OPEN),
+            )
+            for r in rows
+        ]
+
     def areas(self) -> list[Area]:
         with closing(self._connect()) as con:
             rows = con.execute(
@@ -185,7 +213,7 @@ class ThingsDB:
             SELECT uuid, title, notes, status, trashed,
                    creationDate, userModificationDate, stopDate,
                    start, startDate, deadline,
-                   project, area, contact
+                   project, area, contact, heading
             FROM TMTask
             WHERE type = ?
         """
@@ -236,6 +264,7 @@ def _todo_from_row(r: sqlite3.Row, tags_by_task: dict[str, tuple[str, ...]]) -> 
         project_id=r["project"] or None,
         area_id=r["area"] or None,
         contact_id=r["contact"] or None,
+        heading_id=r["heading"] or None,
         start_bucket=_start_bucket(r["start"]),
     )
 
