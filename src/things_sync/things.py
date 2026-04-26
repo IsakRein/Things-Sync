@@ -6,9 +6,10 @@ from enum import Enum
 from typing import Iterable
 
 from . import _osascript as osa
+from ._cloud import ThingsCloud
 from ._osascript import US, as_date, as_str, parse_iso, parse_records
 from ._scripts import script
-from .models import Area, Contact, ListInfo, Project, Status, Tag, Todo
+from .models import Area, Contact, Heading, ListInfo, Project, Status, Tag, Todo
 
 TELL = 'application id "com.culturedcode.ThingsMac"'
 BUILTIN_LISTS = ("Inbox", "Today", "Anytime", "Upcoming", "Someday", "Logbook", "Trash")
@@ -38,7 +39,24 @@ def _split_tags(s: str) -> tuple[str, ...]:
 
 
 class Things:
-    """Synchronous wrapper around Things 3's AppleScript dictionary."""
+    """Synchronous wrapper around Things 3's AppleScript dictionary.
+
+    For ops AppleScript can't do — heading create / delete, clearing a due
+    date — :attr:`cloud` exposes a lazy :class:`ThingsCloud` HTTP client.
+    Cloud writes propagate to all devices on Mac's next sync pull
+    (typically a couple of minutes), so a write isn't immediately visible
+    via the AppleScript reads on this same `Things` instance.
+    """
+
+    def __init__(self) -> None:
+        self._cloud: ThingsCloud | None = None
+
+    @property
+    def cloud(self) -> ThingsCloud:
+        """Lazy-login HTTP client. Requires THINGS_EMAIL + THINGS_PASSWORD env."""
+        if self._cloud is None:
+            self._cloud = ThingsCloud.from_env()
+        return self._cloud
 
     # ------------------------------------------------------------------ meta
 
@@ -423,6 +441,28 @@ class Things:
         end tell
         """
         return _parse_tag(osa.run(script(body)).split(US))
+
+    def create_heading(self, name: str, *, project: str) -> Heading:
+        """Create a heading inside ``project`` via the Things Cloud HTTP API.
+
+        AppleScript has no heading API at all, so this is the only way to
+        programmatically add one. The new heading appears on every device
+        on the next sync pull (a couple of minutes typical).
+        """
+        uuid = self.cloud.add_heading(name, project=project)
+        return Heading(id=uuid, name=name, project_id=project, status=Status.OPEN)
+
+    def trash_heading(self, id: str) -> None:
+        """Soft-delete a heading. Propagates via Things Cloud."""
+        self.cloud.trash(id)
+
+    def clear_due_date(self, id: str) -> None:
+        """Clear an item's due date.
+
+        AppleScript refuses ``missing value`` for date-typed properties so
+        this is the only programmatic path. Works on todos and projects.
+        """
+        self.cloud.clear_due_date(id)
 
     def create_contact(self, name: str) -> Contact:
         body = f"""

@@ -1,0 +1,487 @@
+"""HTTP client for Things Cloud (cloud.culturedcode.com).
+
+Reverse-engineered protocol — confirmed via mitmproxy captures of Things.app.
+The schema constant below is the only pinned version-compat marker; if
+commits start returning 4xx, bump it and re-capture.
+
+Wire format (one history "item" per `commit`):
+
+    {"<uuid>": {"t": <0|1>, "e": "Task6"|"Area3", "p": {...}}}
+
+`t=0` is NEW (full payload); `t=1` is EDIT (sparse delta).
+`tp` inside `p` distinguishes the kind: 0=todo, 1=project, 2=heading.
+
+This is the **write** side. Reads should go through :class:`ThingsDB`.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import threading
+from dataclasses import dataclass
+from datetime import date as Date
+from datetime import datetime, time, timezone
+from pathlib import Path
+from typing import Any, ClassVar, Iterable
+from urllib.parse import quote
+
+import httpx
+import shortuuid
+
+SCHEMA = 301
+BASE = "https://cloud.culturedcode.com"
+API_BASE = f"{BASE}/version/1"
+
+APP_ID = os.environ.get("THINGS_APP_ID", "com.culturedcode.ThingsMac")
+USER_AGENT = os.environ.get(
+    "THINGS_USER_AGENT",
+    "ThingsMac/3.22.2 (Macintosh; Intel Mac OS X 14.4; en_US)",
+)
+
+STATE_DIR = Path(os.environ.get("THINGS_STATE_DIR") or Path.home() / ".cache" / "things-sync")
+STATE_FILE = STATE_DIR / "state.json"
+
+# Things uses a Bitcoin-style alphabet without the visually ambiguous
+# 0/1/O/I/l. A UUID with any of those crashes Things.app's
+# `decodeBase58String.mapBase58` on receive.
+_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_shortuuid = shortuuid.ShortUUID(alphabet=_ALPHABET)
+
+
+def new_uuid() -> str:
+    """22-char Things-shaped UUID."""
+    return _shortuuid.random(length=22)
+
+
+# --- entity / status / dest enums (match SQLite + wire) ---------------------
+
+STATUS_OPEN = 0
+STATUS_CANCELLED = 2
+STATUS_COMPLETE = 3
+
+DEST_INBOX = 0
+DEST_ANYTIME = 1
+DEST_SOMEDAY = 2
+
+TYPE_TASK = 0
+TYPE_PROJECT = 1
+TYPE_HEADING = 2
+
+UPDATE_NEW = 0
+UPDATE_EDIT = 1
+
+
+# --- time codecs ------------------------------------------------------------
+
+
+def _now_ts() -> float:
+    return datetime.now(tz=timezone.utc).timestamp()
+
+
+def _date_ts(d: Date | datetime | str | None) -> int | None:
+    """Things stores dates as midnight-UTC unix ints."""
+    if d is None:
+        return None
+    if isinstance(d, str):
+        d = Date.fromisoformat(d)
+    if isinstance(d, datetime):
+        d = d.date()
+    return int(datetime.combine(d, time.min, tzinfo=timezone.utc).timestamp())
+
+
+# --- payload helpers --------------------------------------------------------
+
+
+def _default_note(value: str = "") -> dict[str, Any]:
+    return {"_t": "tx", "ch": 0, "v": value, "t": 1}
+
+
+def _default_xx() -> dict[str, Any]:
+    return {"_t": "oo", "sn": {}}
+
+
+def _build_payload(
+    *,
+    title: str,
+    tp: int,
+    notes: str = "",
+    project_uuid: str | None = None,
+    area_uuid: str | None = None,
+    heading_uuid: str | None = None,
+    when_ts: int | None = None,
+    deadline_ts: int | None = None,
+    destination: int | None = None,
+    tags: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Build a full NEW-payload for any of task/project/heading.
+
+    Field shape pinned against mitmproxy captures of Things.app.app on
+    2026-04-26 (heading) and 2026-04-20 (task/project).
+    """
+    if destination is None:
+        destination = DEST_ANYTIME if (project_uuid or area_uuid or when_ts or tp != TYPE_TASK) else DEST_INBOX
+    now = _now_ts()
+    return {
+        "ix": 0,
+        "tt": title,
+        "ss": STATUS_OPEN,
+        "st": destination,
+        "tr": False,
+        "cd": now,
+        "md": now,
+        "sr": when_ts,
+        "tir": when_ts,
+        "sp": None,
+        "dd": deadline_ts,
+        "icp": False,
+        "do": 0,
+        "lai": None,
+        "lt": False,
+        "icc": 0,
+        "ti": 0,
+        "ato": None,
+        "icsd": None,
+        "rp": None,
+        "acrd": None,
+        "sb": 0,
+        "rr": None,
+        "pr": [project_uuid] if project_uuid else [],
+        "ar": [area_uuid] if area_uuid else [],
+        "agr": [heading_uuid] if heading_uuid else [],
+        "tg": list(tags),
+        "rt": [],
+        "rmd": None,
+        "dl": [],
+        "dds": None,
+        "tp": tp,
+        "nt": _default_note(notes),
+        "xx": _default_xx(),
+    }
+
+
+def _build_edit(fields: dict[str, Any]) -> dict[str, Any]:
+    """Sparse EDIT body — only non-None keys are sent. `md` always bumped."""
+    out = {k: v for k, v in fields.items() if v is not None}
+    out["md"] = _now_ts()
+    return out
+
+
+# --- credentials / account --------------------------------------------------
+
+
+@dataclass
+class Credentials:
+    email: str
+    password: str
+
+    @classmethod
+    def from_env(cls) -> "Credentials":
+        email = os.environ.get("THINGS_EMAIL")
+        password = os.environ.get("THINGS_PASSWORD")
+        if not email or not password:
+            raise RuntimeError(
+                "Set THINGS_EMAIL and THINGS_PASSWORD in the environment."
+            )
+        return cls(email=email, password=password)
+
+
+@dataclass
+class AccountInfo:
+    email: str
+    history_key: str
+    status: str = ""
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "AccountInfo":
+        return cls(
+            email=data["email"],
+            history_key=data["history-key"],
+            status=data.get("status", ""),
+        )
+
+
+@dataclass
+class Account:
+    credentials: Credentials
+    info: AccountInfo
+
+    @classmethod
+    def login(cls, credentials: Credentials, *, timeout: float = 15.0) -> "Account":
+        pw = quote(credentials.password, safe="'")
+        url = f"{API_BASE}/account/{credentials.email}"
+        r = httpx.get(url, headers={"Authorization": f"Password {pw}"}, timeout=timeout)
+        if r.status_code == 401:
+            raise CloudAuthError("Invalid Things Cloud credentials")
+        r.raise_for_status()
+        return cls(credentials=credentials, info=AccountInfo.from_json(r.json()))
+
+
+class CloudAuthError(RuntimeError):
+    pass
+
+
+class CloudError(RuntimeError):
+    pass
+
+
+# --- client state ----------------------------------------------------------
+
+
+@dataclass
+class CloudState:
+    """Persisted between runs so commits don't need a full history scan.
+
+    `instance_id` identifies *us* to the server — distinct from any real
+    Things.app install so the server fanout doesn't suppress our pushes.
+    """
+
+    history_key: str = ""
+    head_index: int = 0
+    instance_id: str = ""
+
+    @classmethod
+    def load(cls) -> "CloudState":
+        if STATE_FILE.exists():
+            try:
+                data = json.loads(STATE_FILE.read_text())
+                return cls(
+                    history_key=data.get("history_key", ""),
+                    head_index=int(data.get("head_index", 0)),
+                    instance_id=data.get("instance_id", ""),
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        return cls()
+
+    def save(self) -> None:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "history_key": self.history_key,
+                    "head_index": self.head_index,
+                    "instance_id": self.instance_id,
+                }
+            )
+        )
+        tmp.replace(STATE_FILE)
+
+
+# --- the client -------------------------------------------------------------
+
+
+class ThingsCloud:
+    """Synchronous HTTP client for Things Cloud.
+
+    Owns one `httpx.Client` and a small persisted state file at
+    ``~/.cache/things-sync/state.json`` (history-key + head_index + an
+    instance_id distinct from every real Things install).
+
+    All write operations boil down to ``commit(uuid, body)``. The
+    convenience methods (``add_todo``, ``add_heading``, ``edit``, etc.)
+    just build the right body and call ``commit``.
+    """
+
+    _lock: ClassVar[threading.Lock] = threading.Lock()
+
+    def __init__(self, account: Account, *, timeout: float = 20.0) -> None:
+        self.account = account
+        self.state = CloudState.load()
+        if self.state.history_key and self.state.history_key != account.info.history_key:
+            # Account changed — wipe cached cursor.
+            self.state = CloudState(history_key=account.info.history_key)
+        if not self.state.history_key:
+            self.state.history_key = account.info.history_key
+        if not self.state.instance_id:
+            self.state.instance_id = new_uuid()
+            self.state.save()
+
+        self._client = httpx.Client(
+            base_url=f"{API_BASE}/history/{account.info.history_key}",
+            timeout=timeout,
+            headers={
+                "Accept": "application/json",
+                "Accept-Charset": "UTF-8",
+                "Accept-Language": "en-gb",
+                "User-Agent": USER_AGENT,
+                "Schema": str(SCHEMA),
+                "Content-Type": "application/json; charset=UTF-8",
+                "App-Id": APP_ID,
+                "App-Instance-Id": self.state.instance_id,
+                "Push-Priority": "5",
+            },
+        )
+
+        if self.state.head_index == 0:
+            self.refresh_head()
+
+    @classmethod
+    def from_env(cls) -> "ThingsCloud":
+        return cls(Account.login(Credentials.from_env()))
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "ThingsCloud":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    # ---- raw protocol ----
+
+    def fetch(self, start_index: int | None = None) -> dict[str, Any]:
+        """GET /items?start-index=N. Returns raw decoded history."""
+        idx = self.state.head_index if start_index is None else start_index
+        r = self._client.get("/items", params={"start-index": str(idx)})
+        if r.status_code >= 400:
+            raise CloudError(f"Fetch failed [{r.status_code}]: {r.text[:300]}")
+        return r.json()
+
+    def refresh_head(self) -> int:
+        """Bootstrap (or re-bootstrap) the cached head_index from the server."""
+        data = self.fetch(start_index=0)
+        head = int(data["current-item-index"])
+        self.state.head_index = head
+        self.state.save()
+        return head
+
+    def commit(self, item_uuid: str, body: dict[str, Any], *, _retry: int = 1) -> int:
+        """POST /commit. On stale ancestor (409/410/412) refresh + retry once."""
+        with self._lock:
+            params = {"ancestor-index": str(self.state.head_index), "_cnt": "1"}
+            payload = {item_uuid: body}
+            r = self._client.post("/commit", params=params, json=payload)
+            if r.status_code in (409, 410, 412) and _retry > 0:
+                self.refresh_head()
+                return self.commit(item_uuid, body, _retry=_retry - 1)
+            if r.status_code >= 400:
+                raise CloudError(f"Commit failed [{r.status_code}]: {r.text[:300]}")
+            data = r.json()
+            new_head = int(data["server-head-index"])
+            self.state.head_index = new_head
+            self.state.save()
+            return new_head
+
+    # ---- create ----
+
+    def add_todo(
+        self,
+        title: str,
+        *,
+        notes: str = "",
+        when: Date | datetime | str | None = None,
+        deadline: Date | datetime | str | None = None,
+        project: str | None = None,
+        area: str | None = None,
+        heading: str | None = None,
+        tags: Iterable[str] = (),
+    ) -> str:
+        uuid = new_uuid()
+        p = _build_payload(
+            title=title, tp=TYPE_TASK, notes=notes,
+            project_uuid=project, area_uuid=area, heading_uuid=heading,
+            when_ts=_date_ts(when), deadline_ts=_date_ts(deadline), tags=tags,
+        )
+        self.commit(uuid, {"t": UPDATE_NEW, "e": "Task6", "p": p})
+        return uuid
+
+    def add_project(
+        self,
+        title: str,
+        *,
+        notes: str = "",
+        deadline: Date | datetime | str | None = None,
+        area: str | None = None,
+        tags: Iterable[str] = (),
+    ) -> str:
+        uuid = new_uuid()
+        p = _build_payload(
+            title=title, tp=TYPE_PROJECT, notes=notes,
+            area_uuid=area, deadline_ts=_date_ts(deadline), tags=tags,
+            destination=DEST_ANYTIME,
+        )
+        self.commit(uuid, {"t": UPDATE_NEW, "e": "Task6", "p": p})
+        return uuid
+
+    def add_heading(self, title: str, *, project: str) -> str:
+        """Create a heading inside ``project``. Mac/iOS picks it up on next sync."""
+        uuid = new_uuid()
+        p = _build_payload(title=title, tp=TYPE_HEADING, project_uuid=project)
+        self.commit(uuid, {"t": UPDATE_NEW, "e": "Task6", "p": p})
+        return uuid
+
+    def add_area(self, title: str, *, ix: int = 0) -> str:
+        uuid = new_uuid()
+        p = {"xx": _default_xx(), "ix": ix, "tg": [], "tt": title}
+        self.commit(uuid, {"t": UPDATE_NEW, "e": "Area3", "p": p})
+        return uuid
+
+    # ---- edit / status / move ----
+
+    def edit(
+        self,
+        uuid: str,
+        *,
+        title: str | None = None,
+        notes: str | None = None,
+        when: Date | datetime | str | None | bool = False,
+        deadline: Date | datetime | str | None | bool = False,
+        status: int | None = None,
+        trashed: bool | None = None,
+        project: str | None | bool = False,
+        area: str | None | bool = False,
+        heading: str | None | bool = False,
+        tags: Iterable[str] | None = None,
+        index: int | None = None,
+    ) -> int:
+        """Patch a Task6 entity (todo, project, or heading).
+
+        For nullable fields (``when``, ``deadline``, ``project``, ``area``,
+        ``heading``) pass ``None`` to clear, the new value to set, or leave
+        as the default sentinel ``False`` to leave alone.
+        """
+        delta: dict[str, Any] = {}
+        if title is not None:
+            delta["tt"] = title
+        if notes is not None:
+            delta["nt"] = _default_note(notes)
+        if when is not False:
+            ts = _date_ts(when) if when else None
+            delta["sr"] = ts
+            delta["tir"] = ts
+            if ts is not None:
+                delta["st"] = DEST_ANYTIME
+        if deadline is not False:
+            delta["dd"] = _date_ts(deadline) if deadline else None
+        if status is not None:
+            delta["ss"] = status
+            delta["sp"] = int(_now_ts()) if status in (STATUS_COMPLETE, STATUS_CANCELLED) else None
+        if trashed is not None:
+            delta["tr"] = trashed
+        if project is not False:
+            delta["pr"] = [project] if project else []
+        if area is not False:
+            delta["ar"] = [area] if area else []
+        if heading is not False:
+            delta["agr"] = [heading] if heading else []
+        if tags is not None:
+            delta["tg"] = list(tags)
+        if index is not None:
+            delta["ix"] = index
+        if not delta:
+            raise ValueError("edit called with no fields to change")
+        return self.commit(uuid, {"t": UPDATE_EDIT, "e": "Task6", "p": _build_edit(delta)})
+
+    # convenience wrappers
+    def complete(self, uuid: str) -> int: return self.edit(uuid, status=STATUS_COMPLETE)
+    def cancel(self, uuid: str) -> int:   return self.edit(uuid, status=STATUS_CANCELLED)
+    def reopen(self, uuid: str) -> int:   return self.edit(uuid, status=STATUS_OPEN)
+    def trash(self, uuid: str) -> int:    return self.edit(uuid, trashed=True)
+    def untrash(self, uuid: str) -> int:  return self.edit(uuid, trashed=False)
+
+    def clear_due_date(self, uuid: str) -> int:
+        """Clear a due date — the one operation AppleScript can't do."""
+        return self.edit(uuid, deadline=None)
