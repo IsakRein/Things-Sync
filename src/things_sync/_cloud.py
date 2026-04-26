@@ -42,16 +42,29 @@ USER_AGENT = os.environ.get(
 STATE_DIR = Path(os.environ.get("THINGS_STATE_DIR") or Path.home() / ".cache" / "things-sync")
 STATE_FILE = STATE_DIR / "state.json"
 
-# Things uses a Bitcoin-style alphabet without the visually ambiguous
-# 0/1/O/I/l. A UUID with any of those crashes Things.app's
-# `decodeBase58String.mapBase58` on receive.
-_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_shortuuid = shortuuid.ShortUUID(alphabet=_ALPHABET)
+# Things uses standard Bitcoin Base58 — alphabet without the visually
+# ambiguous 0, O, I, l. A UUID with any of those crashes Things.app's
+# `decodeBase58String.mapBase58` on receive. Things also asserts the
+# decoded value fits in 16 bytes — random 22-char strings overflow ~37%
+# of the time and crash the receiver, so we generate a 128-bit int and
+# encode it deterministically with leading-pad to 22 chars.
+_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _b58_encode(n: int) -> str:
+    if n == 0:
+        return _ALPHABET[0]
+    out: list[str] = []
+    base = len(_ALPHABET)
+    while n:
+        n, r = divmod(n, base)
+        out.append(_ALPHABET[r])
+    return "".join(reversed(out))
 
 
 def new_uuid() -> str:
-    """22-char Things-shaped UUID."""
-    return _shortuuid.random(length=22)
+    """22-char Base58-encoded random 128-bit value. Always decodes to ≤16 bytes."""
+    return _b58_encode(secrets.randbits(128)).rjust(22, _ALPHABET[0])
 
 
 # --- entity / status / dest enums (match SQLite + wire) ---------------------
