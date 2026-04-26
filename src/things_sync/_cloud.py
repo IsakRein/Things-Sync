@@ -348,6 +348,32 @@ class ThingsCloud:
         self.state.save()
         return head
 
+    def replay(self) -> dict[str, dict[str, Any]]:
+        """Fetch full history → ``{uuid: item_state}`` map.
+
+        Each value carries the merged payload after replaying NEW + EDIT
+        entries, with an extra ``_e`` key holding the entity name (e.g.
+        ``"Task6"``, ``"Area3"``, ``"Tag4"``, ``"Tombstone2"``). Use the
+        item's ``tp`` to distinguish task / project / heading.
+
+        Server-authoritative read — sees commits the moment they post,
+        regardless of whether Mac has pulled them yet. Use sparingly:
+        scans the entire history, so it's slow on big accounts.
+        """
+        data = self.fetch(start_index=0)
+        out: dict[str, dict[str, Any]] = {}
+        for entry in data.get("items", []):
+            for uuid, body in entry.items():
+                p = body.get("p", {}) or {}
+                if uuid not in out:
+                    out[uuid] = {"_e": body.get("e", "")}
+                if body.get("t") == 0:  # NEW
+                    out[uuid].update(p)
+                    out[uuid]["_e"] = body.get("e", "")
+                else:  # EDIT
+                    out[uuid].update(p)
+        return out
+
     def commit(self, item_uuid: str, body: dict[str, Any], *, _retry: int = 1) -> int:
         """POST /commit. On stale ancestor (409/410/412) refresh + retry once."""
         with self._lock:
