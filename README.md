@@ -1,12 +1,17 @@
 # things-sync
 
-Python wrapper for Things 3. Full CRUD over to-dos, projects, areas,
-tags, and contacts via the Things scripting dictionary — no Cloud HTTP,
-no reverse-engineered protocols, no Shortcuts wrappers. A separate
-read-only SQLite reader handles bulk enumeration at disk speed for
-sync-planning and reporting workloads.
+Python wrapper for Things 3, three layers stacked by what each is best at:
 
-Mac only. Things 3 must be installed.
+- **`Things`** — AppleScript dictionary, for everything in Things' scripting
+  surface (todos, projects, areas, tags, contacts) and the UI ops only a
+  running app can do (`show`, `edit`, `show_quick_entry`).
+- **`ThingsDB`** — read-only SQLite, for bulk enumeration at disk speed.
+- **`ThingsCloud`** — direct HTTP to `cloud.culturedcode.com`, for the few
+  ops AppleScript can't: creating headings, clearing due dates, and any
+  write you want to do without Things running.
+
+Mac requires Things 3 installed for AppleScript / SQLite. `ThingsCloud`
+needs `THINGS_EMAIL` + `THINGS_PASSWORD` and works from anywhere.
 
 ## Install
 
@@ -104,14 +109,50 @@ Frozen dataclasses in `things_sync.models`: `Todo`, `Project`, `Area`,
 `Tag`, `Contact`, `ListInfo`, plus the `Status` enum
 (`open`/`completed`/`canceled`).
 
+## Things Cloud HTTP (`ThingsCloud`)
+
+For the operations AppleScript can't do — creating headings, clearing
+due dates — and any write you want to make without Things running, use
+the cloud client. Works from any machine with `THINGS_EMAIL` and
+`THINGS_PASSWORD` set.
+
+```python
+from things_sync import Things
+
+t = Things()
+t.create_heading("In-Progress", project=project.id)   # AS has no heading API
+t.clear_due_date(todo.id)                              # AS refuses missing value
+t.trash_heading(heading.id)
+```
+
+Or drive the protocol directly:
+
+```python
+from things_sync import ThingsCloud
+
+with ThingsCloud.from_env() as cloud:
+    todo_uuid = cloud.add_todo("Buy milk", deadline="2026-04-30",
+                               project=project_uuid)
+    heading_uuid = cloud.add_heading("Done", project=project_uuid)
+    cloud.complete(todo_uuid)
+    cloud.clear_due_date(todo_uuid)
+```
+
+Writes propagate to every device on the next sync pull (typically
+seconds to a couple of minutes). The local Mac app sees them via the
+same path as any other device — there's no instant read-after-write on
+this machine.
+
+A small state file at `~/.cache/things-sync/state.json` caches the
+account's history-key, current head index, and our app-instance-id.
+
 ## Known AppleScript limits
 
 Things' AppleScript dictionary refuses `missing value` for `date`-typed
-properties (`due date`, `activation date`, etc.). You can change a date
-to another date via `update_todo(id, due_date=...)`, but you can't clear
-it back to "no date" through AppleScript. For that one operation you
-need the `things://` URL scheme (`things:///update?id=X&deadline=`)
-with Things' auth-token — out of scope here.
+properties — `update_todo(id, due_date=...)` can change a deadline but
+not clear it. Use `Things.clear_due_date(id)` (HTTP) for that. AS also
+has no heading surface at all — use `Things.create_heading(name,
+project=...)` and `Things.trash_heading(id)`.
 
 ## Tests
 
@@ -138,7 +179,9 @@ Source layout:
 src/things_sync/
   __init__.py     — public exports
   models.py       — dataclasses
-  things.py       — Things class (all methods)
+  things.py       — Things class (AppleScript ops + .cloud accessor)
+  _db.py          — ThingsDB (read-only SQLite)
+  _cloud.py       — ThingsCloud (HTTP write client)
   _osascript.py   — osascript runner + delimited-output parser
   _scripts.py     — AppleScript prelude + per-class serializers
 ```
