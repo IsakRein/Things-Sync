@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import secrets
 import threading
 from dataclasses import dataclass
 from datetime import date as Date
@@ -27,7 +28,6 @@ from typing import Any, ClassVar, Iterable
 from urllib.parse import quote
 
 import httpx
-import shortuuid
 
 SCHEMA = 301
 BASE = "https://cloud.culturedcode.com"

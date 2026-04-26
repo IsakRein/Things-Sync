@@ -1,9 +1,13 @@
 """Shared fixtures. Tests run against the live Things 3 sandbox.
 
-Each test gets a fresh ``Things`` client. Cleanup uses the Cloud's
-authoritative server view to trash any ``_ts_test_*`` items the test
-created — this avoids the ``ThingsDB`` sync-lag race (Mac may not have
-pulled the just-written items yet).
+The fixture creates a ``Things(sync_after_write=True)`` so each cloud
+write is followed by ``launch()`` + a wait until the row lands in the
+local SQLite. That keeps "create then read by id" patterns working
+without per-test sleeps, at the cost of a few seconds per write.
+
+Cleanup uses the local DB to find ``_ts_test_*`` leftovers and trashes
+them via Cloud. If sync hasn't caught up by the time cleanup runs, a
+few items will leak — they get caught by the next test session.
 """
 from __future__ import annotations
 
@@ -19,28 +23,36 @@ PREFIX = "_ts_test_"
 
 @pytest.fixture
 def things() -> Iterator[Things]:
-    """Cloud-write + DB-read with sync_after_write so tests can read what
-    they just wrote without explicit waits."""
-    yield Things(sync_after_write=True)
+    yield Things(sync_after_write=True, sync_timeout=60.0)
 
 
 @pytest.fixture(autouse=True)
 def _cleanup(things: Things) -> Iterator[None]:
-    """Trash anything we created via Cloud trash. Items still untrashed and
-    matching the ``_ts_test_`` prefix get a ``tr=True`` commit. Server is
-    authoritative — no waiting for Mac to sync."""
     yield
-    try:
-        items = things.cloud.replay()
-    except Exception:  # noqa: BLE001 — cloud unavailable, skip cleanup
+    leftovers: list[str] = []
+    db = things.db
+    for t in db.todos():
+        if t.name.startswith(PREFIX):
+            leftovers.append(t.id)
+    for p in db.projects():
+        if p.name.startswith(PREFIX):
+            leftovers.append(p.id)
+    for h in db.headings():
+        if h.name.startswith(PREFIX):
+            leftovers.append(h.id)
+    for a in db.areas():
+        if a.name.startswith(PREFIX):
+            leftovers.append(a.id)
+    for tag in db.tags():
+        if tag.name.startswith(PREFIX):
+            leftovers.append(tag.id)
+    if not leftovers:
         return
-    for uuid, p in items.items():
-        if p.get("tr"):  # already trashed
-            continue
-        title = p.get("tt") or ""
-        if not isinstance(title, str) or not title.startswith(PREFIX):
-            continue
-        try:
-            things.cloud.trash(uuid)
-        except Exception:  # noqa: BLE001
-            pass
+    try:
+        for uid in leftovers:
+            try:
+                things.cloud.trash(uid)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
