@@ -671,7 +671,7 @@ class Things:
                 return
             if not gone and active:
                 return
-            time.sleep(0.5)
+            time.sleep(0.25)
 
     def _effective_todo(
         self,
