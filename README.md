@@ -311,6 +311,56 @@ to bridge the gap, depending on the read path:
 Mirror reads sidestep this entirely; the others are still useful when
 the consumer already reads from `ThingsDB` or doesn't run a mirror.
 
+## Operation log
+
+Every cloud touch and every mirror state change is appended as one
+JSON line to `~/.cache/things-sync/ops.jsonl`. This is the audit
+trail to consult when something crashes Things or a write goes
+missing — the file is the source of truth for what we sent, in what
+order, and what happened.
+
+Events:
+
+| op | when |
+| --- | --- |
+| `fetch.start` / `fetch.ok` / `fetch.error` | every cloud GET |
+| `commit.start` | every cloud POST (full `body.p`, truncated at 500 chars/field) |
+| `commit.retry` | 409/410/412 stale-ancestor; logs sleep ms + new head |
+| `commit.ok` / `commit.error` / `commit.exhausted` | terminal states |
+| `mirror.pull.start` / `mirror.pull.ok` / `mirror.pull.error` | mirror sync |
+| `mirror.on_commit` | write-side hook applies a commit locally; flag `fast_path` distinguishes the in-place apply from a full pull |
+
+Each entry has `ts` (millisecond ISO), `pid`, `op`, plus op-specific
+fields. Each `commit.*` shares an `id` so you can join start ↔ retry
+↔ ok/error lines.
+
+Properties:
+
+- **Append-only and concurrent-safe**: a single `json.dumps` line
+  fits well under `PIPE_BUF`, so multi-process writers (`atlas
+  watch`, hooks, ad-hoc scripts, the crash-test suite) can all log
+  to the same file without corruption.
+- **Never raises**: disk-full or permission errors are swallowed so
+  a broken log can't take down a real cloud write.
+- **Truncation**: long strings cap at 500 chars, lists at 50 entries
+  — log stays scannable; the full payload still exists on the cloud
+  history.
+
+Tail it:
+
+```bash
+tail -f ~/.cache/things-sync/ops.jsonl
+# or filter:
+grep '"op":"commit' ~/.cache/things-sync/ops.jsonl | tail -50
+```
+
+Set `THINGS_SYNC_LOG=1` to also mirror lines to stderr — handy for
+live debugging without watching a second terminal.
+
+`ThingsDB` reads (read-only Things' own SQLite) are intentionally
+not logged: pure local queries, no risk surface, and they'd flood
+the file.
+
 ## Known AppleScript limits
 
 - AS refuses `missing value` for date-typed properties — use

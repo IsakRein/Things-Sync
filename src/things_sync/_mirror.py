@@ -237,6 +237,19 @@ class ThingsMirror:
             merged = dict(p)
             new_entity = entity or row["entity"]
         else:
+            # Things-Mac echoes diagnostic-only CRDT markers like
+            # ``{"_t": "tx", "t": 0, "diag": "apply"}`` for unchanged
+            # text fields (notes, etc). Blindly replacing the field
+            # would wipe its real value (the marker has no ``v``).
+            # Treat any ``_t=tx``+``t=0`` dict as a no-op for that key.
+            for k, v in list(p.items()):
+                if (
+                    isinstance(v, dict)
+                    and v.get("_t") == "tx"
+                    and v.get("t") == 0
+                    and "v" not in v
+                ):
+                    p = {kk: vv for kk, vv in p.items() if kk != k}
             merged.update(p)
             new_entity = row["entity"] or entity
         new_tp = merged.get("tp", row["tp"])
