@@ -565,6 +565,12 @@ class ThingsCloud:
     def trash(self, uuid: str) -> int:    return self.edit(uuid, trashed=True)
     def untrash(self, uuid: str) -> int:  return self.edit(uuid, trashed=False)
 
+    def trash_heading(self, uuid: str) -> int:
+        """Trash a heading. Headings are Task6 entities so the verb is
+        the same as :meth:`trash` — kept here for symmetry with
+        :meth:`add_heading`."""
+        return self.trash(uuid)
+
     def clear_due_date(self, uuid: str) -> int:
         """Clear a due date — the one operation AppleScript can't do."""
         return self.edit(uuid, deadline=None)
