@@ -30,6 +30,8 @@ from urllib.parse import quote
 
 import httpx
 
+from ._log import log_op
+
 SCHEMA = 301
 BASE = "https://cloud.culturedcode.com"
 API_BASE = f"{BASE}/version/1"
@@ -388,11 +390,25 @@ class ThingsCloud:
 
     def fetch(self, start_index: int | None = None) -> dict[str, Any]:
         """GET /items?start-index=N. Returns raw decoded history."""
+        started = _time.time()
+        op_id = secrets.token_hex(4)
         idx = self.state.head_index if start_index is None else start_index
+        log_op("fetch.start", id=op_id, start_index=idx)
         r = self._client.get("/items", params={"start-index": str(idx)})
+        ms = int((_time.time() - started) * 1000)
         if r.status_code >= 400:
+            log_op(
+                "fetch.error", id=op_id, status=r.status_code, ms=ms,
+                body_preview=r.text[:300],
+            )
             raise CloudError(f"Fetch failed [{r.status_code}]: {r.text[:300]}")
-        return r.json()
+        data = r.json()
+        items = data.get("items", []) or []
+        log_op(
+            "fetch.ok", id=op_id, ms=ms,
+            head=data.get("current-item-index"), n_items=len(items),
+        )
+        return data
 
     def refresh_head(self) -> int:
         """Bootstrap (or re-bootstrap) the cached head_index from the server."""
@@ -435,21 +451,46 @@ class ThingsCloud:
         concurrently — a single retry isn't enough when Mac is in a
         burst. We do up to ``_retry`` attempts with short backoff
         (50/150/350/750 ms) before raising.
+
+        Every step (start, retry, ok, error, exhausted) is recorded
+        in ``~/.cache/things-sync/ops.jsonl`` via :func:`log_op` for
+        post-mortem attribution.
         """
         import random as _random
+        started = _time.time()
+        op_id = secrets.token_hex(4)
+        log_op(
+            "commit.start", id=op_id, uuid=item_uuid,
+            t=body.get("t"), e=body.get("e"),
+            ancestor_index=self.state.head_index,
+            p=body.get("p") or {},
+        )
         with self._lock:
             for attempt in range(_retry + 1):
                 params = {"ancestor-index": str(self.state.head_index), "_cnt": "1"}
                 payload = {item_uuid: body}
                 r = self._client.post("/commit", params=params, json=payload)
                 if r.status_code in (409, 410, 412) and attempt < _retry:
+                    prev_head = self.state.head_index
                     self.refresh_head()
                     # Exponential backoff with jitter so concurrent watchers
                     # / pollers don't dogpile the same head_index.
                     sleep_s = 0.05 * (3 ** attempt) + _random.uniform(0, 0.05)
+                    log_op(
+                        "commit.retry", id=op_id, status=r.status_code,
+                        attempt=attempt + 1, prev_head=prev_head,
+                        new_head=self.state.head_index,
+                        sleep_ms=int(sleep_s * 1000),
+                    )
                     _time.sleep(sleep_s)
                     continue
+                ms = int((_time.time() - started) * 1000)
                 if r.status_code >= 400:
+                    log_op(
+                        "commit.error", id=op_id, status=r.status_code,
+                        attempts=attempt + 1, ms=ms,
+                        body_preview=r.text[:300],
+                    )
                     raise CloudError(
                         f"Commit failed [{r.status_code}] after "
                         f"{attempt + 1} attempt(s): {r.text[:300]}"
@@ -460,8 +501,15 @@ class ThingsCloud:
                 self.state.save()
                 if self._commit_hook is not None:
                     self._commit_hook(item_uuid, body, new_head)
+                log_op(
+                    "commit.ok", id=op_id, head=new_head,
+                    attempts=attempt + 1, ms=ms,
+                )
                 return new_head
-            # unreachable — loop either returns or raises
+            log_op(
+                "commit.exhausted", id=op_id,
+                ms=int((_time.time() - started) * 1000),
+            )
             raise CloudError("commit: exhausted retries without resolving")
 
     # ---- create ----

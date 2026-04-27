@@ -29,12 +29,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time as _time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from ._cloud import STATE_DIR, ThingsCloud
+from ._log import log_op
 from .models import Area, Heading, Project, StartBucket, Status, Tag, Todo
 
 SCHEMA_VERSION = 1
@@ -153,24 +155,42 @@ class ThingsMirror:
         Returns the number of items applied. Safe to call repeatedly;
         a no-op when the mirror is already caught up.
         """
+        started = _time.time()
         with self._lock:
             start = self.applied_index
-            data = self.cloud.fetch(start_index=start)
-            items = data.get("items", []) or []
-            new_head = int(data.get("current-item-index", start + len(items)))
-            with closing(self._connect()) as conn:
-                conn.execute("BEGIN")
-                try:
-                    idx = start
-                    for entry in items:
-                        idx += 1
-                        for uuid, body in entry.items():
-                            self._apply(conn, idx, uuid, body)
-                    self._set_meta(conn, "applied_index", str(new_head))
-                    conn.execute("COMMIT")
-                except Exception:
-                    conn.execute("ROLLBACK")
-                    raise
+            log_op("mirror.pull.start", from_index=start)
+            try:
+                data = self.cloud.fetch(start_index=start)
+                items = data.get("items", []) or []
+                new_head = int(data.get("current-item-index", start + len(items)))
+                with closing(self._connect()) as conn:
+                    conn.execute("BEGIN")
+                    try:
+                        idx = start
+                        for entry in items:
+                            idx += 1
+                            for uuid, body in entry.items():
+                                self._apply(conn, idx, uuid, body)
+                        self._set_meta(conn, "applied_index", str(new_head))
+                        conn.execute("COMMIT")
+                    except Exception:
+                        conn.execute("ROLLBACK")
+                        raise
+            except Exception as e:
+                log_op(
+                    "mirror.pull.error",
+                    from_index=start,
+                    error=f"{type(e).__name__}: {e}",
+                    ms=int((_time.time() - started) * 1000),
+                )
+                raise
+            log_op(
+                "mirror.pull.ok",
+                from_index=start,
+                applied=len(items),
+                head=new_head,
+                ms=int((_time.time() - started) * 1000),
+            )
             return len(items)
 
     def reset(self) -> int:
@@ -291,6 +311,11 @@ class ThingsMirror:
         """
         with self._lock:
             applied = self.applied_index
+            log_op(
+                "mirror.on_commit", uuid=uuid, t=body.get("t"),
+                e=body.get("e"), applied=applied, new_head=new_head,
+                fast_path=(applied + 1 == new_head),
+            )
             if applied + 1 == new_head:
                 with closing(self._connect()) as conn:
                     conn.execute("BEGIN")
