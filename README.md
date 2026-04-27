@@ -1,6 +1,6 @@
 # things-sync
 
-Python wrapper for Things 3, three layers stacked by what each is best at:
+Python wrapper for Things 3. Three layers stacked by what each is best at:
 
 - **`ThingsCloud`** — direct HTTP to `cloud.culturedcode.com`. Every
   write goes through here. Authoritative the moment the POST returns;
@@ -11,7 +11,8 @@ Python wrapper for Things 3, three layers stacked by what each is best at:
 - **`Things`** — façade that routes calls to the right layer above.
   Falls back to AppleScript only for UI nudges (`show`, `edit`, quick
   entry, launch/quit), `selected_todos`, the few ops cloud doesn't
-  cover yet (tag/contact create, area edit), and `empty_trash`.
+  cover yet (tag/contact create, area edit, tag edit), and
+  `empty_trash`.
 
 Mac requires Things 3 installed for SQLite reads + AS UI ops.
 `ThingsCloud` works standalone from any machine.
@@ -31,8 +32,6 @@ from things_sync import Things
 
 t = Things()
 
-# Reads
-inbox = t.todos_in_list("Inbox")
 project = t.create_project("Plan trip", deadline="2026-05-01")
 todo = t.create_todo(
     "Book flights",
@@ -42,18 +41,109 @@ todo = t.create_todo(
     project=project.id,
 )
 
-# Update
 t.update_todo(todo.id, notes="window seat actually")
-
-# Status
 t.complete(todo.id)
 
-# Soft delete (recoverable in Trash) → hard purge
-t.delete(todo.id)
-t.empty_trash()
-# or convenience:
-t.delete_immediately(project.id)
+t.delete(todo.id)        # → Trash (recoverable)
+t.empty_trash()          # purge
 ```
+
+## Entity & operation matrix
+
+What's supported on each entity type today, and which layer carries it.
+Cloud == HTTP commit (works without Things running). AS == AppleScript.
+DB == read-only SQLite.
+
+| Entity   | Create                | Read              | Edit fields                                              | Status (open/complete/cancel/reopen) | Trash / purge          |
+|----------|-----------------------|-------------------|----------------------------------------------------------|--------------------------------------|------------------------|
+| Todo     | Cloud                 | DB                | name, notes, due_date, when (schedule), tags, project, area, heading | Cloud (`complete`/`cancel`/`reopen`) | Cloud (`delete`) + AS (`empty_trash`) |
+| Project  | Cloud                 | DB                | name, notes, due_date, tags, area                        | Cloud (`complete`/`cancel`/`reopen` via `update_project(status=…)`) | Cloud (`delete`) + AS (`empty_trash`) |
+| Heading  | Cloud (`create_heading`) | DB             | name (via `t.cloud.edit(id, title=…)`)†                  | n/a                                  | Cloud (`trash_heading`) |
+| Area     | Cloud (`create_area`) | DB                | name, tags, collapsed (AS only)                          | n/a                                  | not exposed            |
+| Tag      | AS (`create_tag`)     | DB                | name, shortcut, parent (AS only)                         | n/a                                  | not exposed            |
+| Contact  | AS (`create_contact`) | DB                | not exposed                                              | n/a                                  | not exposed            |
+
+† Headings rename through the raw cloud client because Things treats
+them as `Task6` entities (same wire format as todos/projects). The
+façade exposes `create_heading` and `trash_heading`; for renames use
+`t.cloud.edit(heading_id, title="New name")`.
+
+### Editing semantics
+
+`update_todo` / `update_project` / `update_area` / `update_tag` accept
+keyword arguments only. Pass a value to set it; **omit** the keyword to
+leave the field alone.
+
+For nullable fields on todos and projects (`due_date`, `project`,
+`area`, `heading`, `contact`), pass `None` to clear:
+
+```python
+t.update_todo(todo.id, due_date=None, project=None, heading=None)
+```
+
+Cleared dates work on todos (`update_todo(id, due_date=None)` clears
+the deadline via Cloud). Note that AppleScript can't clear dates at
+all; the wrapper avoids that path. There's also a one-off
+`Things.clear_due_date(id)` if you only need that operation.
+
+Renaming, re-dating, re-noting are all the same call:
+
+```python
+t.update_todo(todo.id, name="Book trains instead", notes="rebook",
+              due_date="2026-05-15", tags=["travel", "urgent"])
+t.update_project(project.id, name="Plan adventure",
+                 due_date="2026-06-01", area=area.id)
+t.update_area(area.id, name="Personal", collapsed=True)
+t.update_tag(tag.id, name="errands", shortcut="e")
+```
+
+### Status moves
+
+```python
+t.complete(todo.id)
+t.cancel(todo.id)
+t.reopen(todo.id)
+```
+
+For projects, status goes through `update_project(id, status=…)` with
+`Status.OPEN` / `Status.COMPLETED` / `Status.CANCELED`.
+
+### Schedule / move
+
+Not the same as setting a due date — `when` is the start/scheduled
+date that decides which built-in list (Today / Upcoming / Anytime /
+Someday) the todo shows up in.
+
+```python
+from datetime import date
+
+t.schedule(todo.id, date.today())            # → Today
+t.schedule(todo.id, "2026-05-10")            # → Upcoming, then Today on the day
+t.move_to_list(todo.id, "Anytime")           # clear schedule
+t.move_to_list(todo.id, "Someday")
+t.move_to_list(todo.id, "Inbox")             # also clears project/area/heading
+t.move_to_list(todo.id, "Trash")             # → soft-trash via Cloud
+t.move_to_list(todo.id, "Logbook")           # → complete
+
+t.move_to_project(todo.id, project.id)
+t.move_to_area(todo.id, area.id)
+```
+
+`Upcoming` is derived from a future schedule date, not a destination —
+use `schedule(id, future_date)` rather than `move_to_list(id,
+"Upcoming")` (which raises).
+
+### Deletion
+
+```python
+t.delete(todo.id)            # soft, → Trash, recoverable
+t.empty_trash()              # AS-only: purges all currently-trashed items
+t.delete_immediately(todo.id)  # convenience: trash + empty
+```
+
+Soft-trash works on todos, projects, and headings. Heading purge has a
+dedicated `trash_heading(id)`. Areas, tags, and contacts have no
+exposed delete path today.
 
 ## API surface
 
@@ -63,20 +153,22 @@ on every create / read).
 **Reads.** `version`, `count_todos`, `count_projects`, `count_areas`,
 `count_tags`, `lists`, `todos`, `todo`, `todos_in_list`,
 `todos_in_project`, `todos_in_area`, `todos_with_tag`, `selected_todos`,
-`projects`, `project`, `areas`, `area`, `tags`, `tag`, `contacts`,
-`exists`.
+`projects`, `project`, `headings`, `areas`, `area`, `tags`, `tag`,
+`contacts`, `exists`.
 
-**Create.** `create_todo`, `create_project`, `create_area`, `create_tag`,
-`create_contact`, `parse_quicksilver`.
+**Create.** `create_todo`, `create_project`, `create_heading`,
+`create_area`, `create_tag`, `create_contact`, `parse_quicksilver`.
 
 **Update.** `update_todo`, `update_project`, `update_area`, `update_tag`.
+(Heading rename → `t.cloud.edit(id, title=…)`.)
 
 **Status.** `complete`, `cancel`, `reopen`.
 
 **Move / schedule.** `move_to_list`, `move_to_area`, `move_to_project`,
 `schedule`.
 
-**Delete.** `delete` (→ Trash), `empty_trash`, `delete_immediately`.
+**Delete.** `delete` (→ Trash), `trash_heading`, `empty_trash`,
+`delete_immediately`, `clear_due_date`.
 
 **UI.** `show`, `edit`, `show_quick_entry`, `launch`, `quit`,
 `is_running`.
@@ -96,6 +188,7 @@ from things_sync import ThingsDB, Status
 db = ThingsDB()                      # autodetects ~/Library/Group Containers/…
 open_todos = [t for t in db.todos() if t.status == Status.OPEN]
 projects   = db.projects()
+headings   = db.headings()
 areas      = db.areas()
 tags       = db.tags()
 ```
@@ -108,38 +201,42 @@ container.
 
 ## Models
 
-Frozen dataclasses in `things_sync.models`: `Todo`, `Project`, `Area`,
-`Tag`, `Contact`, `ListInfo`, plus the `Status` enum
-(`open`/`completed`/`canceled`).
+Frozen dataclasses in `things_sync.models`: `Todo`, `Project`, `Heading`,
+`Area`, `Tag`, `Contact`, `ListInfo`, plus the `Status` enum
+(`open`/`completed`/`canceled`) and `StartBucket`
+(`inbox`/`anytime`/`someday`).
 
 ## Things Cloud HTTP (`ThingsCloud`)
 
-For the operations AppleScript can't do — creating headings, clearing
-due dates — and any write you want to make without Things running, use
-the cloud client. Works from any machine with `THINGS_EMAIL` and
-`THINGS_PASSWORD` set.
-
-```python
-from things_sync import Things
-
-t = Things()
-t.create_heading("In-Progress", project=project.id)   # AS has no heading API
-t.clear_due_date(todo.id)                              # AS refuses missing value
-t.trash_heading(heading.id)
-```
-
-Or drive the protocol directly:
+For the operations the façade doesn't expose, or any write you want to
+make without Things running, drop down to the cloud client. Works from
+any machine with `THINGS_EMAIL` and `THINGS_PASSWORD` set.
 
 ```python
 from things_sync import ThingsCloud
 
 with ThingsCloud.from_env() as cloud:
-    todo_uuid = cloud.add_todo("Buy milk", deadline="2026-04-30",
-                               project=project_uuid)
+    todo_uuid    = cloud.add_todo("Buy milk", deadline="2026-04-30",
+                                  project=project_uuid)
+    project_uuid = cloud.add_project("Plan trip")
     heading_uuid = cloud.add_heading("Done", project=project_uuid)
+    area_uuid    = cloud.add_area("Personal")
+
+    cloud.edit(todo_uuid, title="Buy oat milk", notes="…",
+               deadline="2026-05-01", tags=[tag_uuid],
+               project=project_uuid, heading=heading_uuid)
+    cloud.edit(heading_uuid, title="Completed")  # rename a heading
+
     cloud.complete(todo_uuid)
     cloud.clear_due_date(todo_uuid)
+    cloud.trash(todo_uuid)
+    cloud.untrash(todo_uuid)
 ```
+
+`cloud.edit()` is the single-entry edit verb; it patches any `Task6`
+entity (todo, project, or heading). For nullable fields (`when`,
+`deadline`, `project`, `area`, `heading`) `None` clears, a value sets,
+and the default sentinel `False` leaves the field alone.
 
 Writes propagate to every device on the next sync pull (typically
 seconds to a couple of minutes). The local Mac app sees them via the
@@ -149,13 +246,33 @@ this machine.
 A small state file at `~/.cache/things-sync/state.json` caches the
 account's history-key, current head index, and our app-instance-id.
 
+## Read-after-write
+
+Cloud writes are authoritative on the server immediately, but
+`ThingsDB` reads reflect Things' local SQLite, which lags by Mac's
+sync poll cycle (~5-15s foreground, up to ~3 min idle). For tests or
+scripts that care:
+
+```python
+t = Things(sync_after_write=True)   # blocks each write until uuid lands locally
+```
+
+This calls `Things.launch()` (= `tell ... to activate`) after every
+cloud write, which forces an immediate poll and drops the round trip
+to ~2.5s. Off by default; in interactive use you usually don't need
+to read back what you just wrote.
+
+You can also nudge a single sync ad-hoc with `Things().launch()`
+without committing to per-write blocking.
+
 ## Known AppleScript limits
 
-Things' AppleScript dictionary refuses `missing value` for `date`-typed
-properties — `update_todo(id, due_date=...)` can change a deadline but
-not clear it. Use `Things.clear_due_date(id)` (HTTP) for that. AS also
-has no heading surface at all — use `Things.create_heading(name,
-project=...)` and `Things.trash_heading(id)`.
+- AS refuses `missing value` for date-typed properties — use
+  `update_todo(id, due_date=None)` (Cloud) or `clear_due_date(id)`.
+- AS has no heading API — headings live entirely on Cloud (`create_heading`
+  / `trash_heading` / `cloud.edit(id, title=…)`).
+- `lists` and `todos_in_list` route through the DB because the AS
+  `lists` collection is broken on Things 3.22.11.
 
 ## Tests
 
@@ -176,22 +293,6 @@ an account reset to recover. Two safety nets prevent that now —
 `_cloud.new_uuid()` only produces ≤16-byte values and
 `_cloud._validate_uuids()` rejects non-Base58 strings before they hit
 the wire — but the surface area is large; use a sandbox account.
-
-## Read-after-write
-
-Cloud writes are authoritative on the server immediately, but
-`ThingsDB` reads reflect Things' local SQLite, which lags by Mac's
-sync poll cycle (~5-15s foreground, up to ~3 min idle). For tests or
-scripts that care:
-
-```python
-t = Things(sync_after_write=True)   # blocks each write until uuid lands locally
-```
-
-This calls `Things.launch()` (= `tell ... to activate`) after every
-cloud write, which forces an immediate poll and drops the round trip
-to ~2.5s. Off by default; in interactive use you usually don't need
-to read back what you just wrote.
 
 ## How it works
 
@@ -217,7 +318,7 @@ Source layout:
 src/things_sync/
   __init__.py     — public exports
   models.py       — dataclasses
-  things.py       — Things class (AppleScript ops + .cloud accessor)
+  things.py       — Things class (façade + AS-only ops)
   _db.py          — ThingsDB (read-only SQLite)
   _cloud.py       — ThingsCloud (HTTP write client)
   _osascript.py   — osascript runner + delimited-output parser
