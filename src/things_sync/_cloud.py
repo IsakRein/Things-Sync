@@ -566,7 +566,7 @@ class ThingsCloud:
     def trash(self, uuid: str) -> int:    return self.edit(uuid, trashed=True)
     def untrash(self, uuid: str) -> int:  return self.edit(uuid, trashed=False)
 
-    def delete(self, uuid: str) -> int:
+    def delete(self, uuid: str, *, entity: str = "Task6") -> int:
         """Hard-delete an entity via a ``t=2`` tombstone commit.
 
         Goes around the soft-trash path (``tr=True``) entirely — the
@@ -574,8 +574,22 @@ class ThingsCloud:
         usually want :meth:`trash` so the user can recover from the
         Trash list; for headings ``tr=True`` is silently ignored by
         Things' UI, so :meth:`delete` is the only verb that works.
+
+        ``entity`` MUST be set on the wire — Things' pull-side parser
+        crashes (``SCChangeMapCreateWithPropertyList`` → process
+        terminate) on a ``t=2`` commit missing the ``e`` field, and the
+        bad commit then poisons every device on the account because
+        cloud history is append-only. We default ``entity="Task6"``
+        because that's what Things itself emits for todo / project /
+        heading deletes, and we hard-assert non-empty here so a future
+        caller can't drop it again.
         """
-        return self.commit(uuid, {"t": UPDATE_DELETE, "p": {}})
+        if not entity:
+            raise ValueError(
+                "delete: `entity` must be set on a t=2 tombstone — a missing "
+                "`e` field crashes Things on pull and poisons the entire account."
+            )
+        return self.commit(uuid, {"t": UPDATE_DELETE, "e": entity, "p": {}})
 
     def trash_heading(self, uuid: str) -> int:
         """Delete a heading. Things has no Trash view for headings —
