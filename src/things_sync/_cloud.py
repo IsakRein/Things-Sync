@@ -326,7 +326,11 @@ class ThingsCloud:
     just build the right body and call ``commit``.
     """
 
-    _lock: ClassVar[threading.Lock] = threading.Lock()
+    # RLock so commit()'s 409-retry recursion (refresh_head + self-call) can
+    # re-enter from the same thread without deadlocking. With a plain Lock,
+    # the recursive call blocks forever and wedges every other thread that
+    # touches Cloud (the lock is class-level, shared across instances).
+    _lock: ClassVar[threading.RLock] = threading.RLock()
 
     def __init__(self, account: Account, *, timeout: float = 20.0) -> None:
         self.account = account
