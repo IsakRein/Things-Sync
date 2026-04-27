@@ -2,16 +2,19 @@
 
 Python wrapper for Things 3, three layers stacked by what each is best at:
 
-- **`Things`** — AppleScript dictionary, for everything in Things' scripting
-  surface (todos, projects, areas, tags, contacts) and the UI ops only a
-  running app can do (`show`, `edit`, `show_quick_entry`).
-- **`ThingsDB`** — read-only SQLite, for bulk enumeration at disk speed.
-- **`ThingsCloud`** — direct HTTP to `cloud.culturedcode.com`, for the few
-  ops AppleScript can't: creating headings, clearing due dates, and any
-  write you want to do without Things running.
+- **`ThingsCloud`** — direct HTTP to `cloud.culturedcode.com`. Every
+  write goes through here. Authoritative the moment the POST returns;
+  Mac sees the change on its next sync pull. Works without Things
+  running. Needs `THINGS_EMAIL` + `THINGS_PASSWORD`.
+- **`ThingsDB`** — read-only SQLite at disk speed. Every read goes
+  through here.
+- **`Things`** — façade that routes calls to the right layer above.
+  Falls back to AppleScript only for UI nudges (`show`, `edit`, quick
+  entry, launch/quit), `selected_todos`, the few ops cloud doesn't
+  cover yet (tag/contact create, area edit), and `empty_trash`.
 
-Mac requires Things 3 installed for AppleScript / SQLite. `ThingsCloud`
-needs `THINGS_EMAIL` + `THINGS_PASSWORD` and works from anywhere.
+Mac requires Things 3 installed for SQLite reads + AS UI ops.
+`ThingsCloud` works standalone from any machine.
 
 ## Install
 
@@ -160,18 +163,53 @@ project=...)` and `Things.trash_heading(id)`.
 uv run pytest
 ```
 
-42 live tests run against the Things 3 instance on this machine. Every
-created entity is name-prefixed `_ts_test_` and purged in teardown, so
-re-running the suite is idempotent. **Do not run against a Things
-account holding real data** — even though cleanup is best-effort, a
-crashed test could leave stray items in your Trash.
+Live tests run against the Things 3 instance on this machine. Every
+created entity is name-prefixed `_ts_test_` and purged in teardown.
+Tests use `Things(sync_after_write=True)` so creates block until they
+land in local SQLite — pacing is bounded by Mac's sync polls. Some
+tests are slow (tens of seconds) for that reason.
+
+**Do not run against a Things account holding real data.** Cleanup is
+best-effort; the much bigger risk historically was UUID/wire-format
+bugs poisoning the Cloud account (history is append-only) and forcing
+an account reset to recover. Two safety nets prevent that now —
+`_cloud.new_uuid()` only produces ≤16-byte values and
+`_cloud._validate_uuids()` rejects non-Base58 strings before they hit
+the wire — but the surface area is large; use a sandbox account.
+
+## Read-after-write
+
+Cloud writes are authoritative on the server immediately, but
+`ThingsDB` reads reflect Things' local SQLite, which lags by Mac's
+sync poll cycle (~5-15s foreground, up to ~3 min idle). For tests or
+scripts that care:
+
+```python
+t = Things(sync_after_write=True)   # blocks each write until uuid lands locally
+```
+
+This calls `Things.launch()` (= `tell ... to activate`) after every
+cloud write, which forces an immediate poll and drops the round trip
+to ~2.5s. Off by default; in interactive use you usually don't need
+to read back what you just wrote.
 
 ## How it works
 
-Each method assembles an AppleScript snippet (prelude with helpers +
-operation body) and pipes it to `osascript -`. Reads serialize records
-using ASCII unit (`\x1f`) and record (`\x1e`) separators, parsed back
-into dataclasses on the Python side.
+Writes build a JSON commit body and POST to
+`cloud.culturedcode.com/version/1/history/<key>/commit`. The protocol
+is reverse-engineered (originally captured via mitmproxy); see
+`_cloud.py` for the wire-format helpers. UUIDs are 22-char Base58
+generated as `secrets.randbits(128)` encoded with leading-`1` pad —
+this guarantees ≤16-byte decode (random 22-char Base58 overflows ~37%
+of the time and crashes Things).
+
+Reads go through plain SQLite (`sqlite3` stdlib, `mode=ro`) on the
+Things database in
+`~/Library/Group Containers/JLMPQHK86H.com.culturedcode.ThingsMac/`.
+
+The few methods that still go through AppleScript pipe a script
+through `osascript -`; reads serialize records using ASCII unit
+(`\x1f`) and record (`\x1e`) separators, parsed back into dataclasses.
 
 Source layout:
 
