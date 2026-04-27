@@ -603,7 +603,7 @@ class Things:
         self._settle(id, gone=True)
 
     def trash_heading(self, id: str) -> None:
-        self.cloud.trash(id)
+        self.cloud.trash_heading(id)
         self._settle(id, gone=True)
 
     def empty_trash(self) -> None:

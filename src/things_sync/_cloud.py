@@ -83,6 +83,7 @@ TYPE_HEADING = 2
 
 UPDATE_NEW = 0
 UPDATE_EDIT = 1
+UPDATE_DELETE = 2  # tombstone: empty `p`, no `e` — tells receivers to drop the entity
 
 
 # --- time codecs ------------------------------------------------------------
@@ -565,11 +566,23 @@ class ThingsCloud:
     def trash(self, uuid: str) -> int:    return self.edit(uuid, trashed=True)
     def untrash(self, uuid: str) -> int:  return self.edit(uuid, trashed=False)
 
+    def delete(self, uuid: str) -> int:
+        """Hard-delete an entity via a ``t=2`` tombstone commit.
+
+        Goes around the soft-trash path (``tr=True``) entirely — the
+        entity is removed, not merely flagged. For todos/projects you
+        usually want :meth:`trash` so the user can recover from the
+        Trash list; for headings ``tr=True`` is silently ignored by
+        Things' UI, so :meth:`delete` is the only verb that works.
+        """
+        return self.commit(uuid, {"t": UPDATE_DELETE, "p": {}})
+
     def trash_heading(self, uuid: str) -> int:
-        """Trash a heading. Headings are Task6 entities so the verb is
-        the same as :meth:`trash` — kept here for symmetry with
-        :meth:`add_heading`."""
-        return self.trash(uuid)
+        """Delete a heading. Things has no Trash view for headings —
+        ``tr=True`` is silently ignored by the UI — so we route this
+        through :meth:`delete` (a ``t=2`` tombstone commit) which is
+        what Things itself emits on a manual heading delete."""
+        return self.delete(uuid)
 
     def clear_due_date(self, uuid: str) -> int:
         """Clear a due date — the one operation AppleScript can't do."""

@@ -191,7 +191,11 @@ class ThingsMirror:
         t = body.get("t")
         entity = body.get("e", "") or ""
         p = body.get("p", {}) or {}
-        is_tombstone = entity == "Tombstone2"
+        # ``t=2`` is a tombstone commit (empty payload, no entity name).
+        # ``e == "Tombstone2"`` is the older entity-shaped variant we've
+        # also seen on the wire. Either way: drop the row from default
+        # reads.
+        is_delete = (t == 2) or entity == "Tombstone2"
 
         row = conn.execute(
             "SELECT entity, tp, payload, deleted FROM entities WHERE uuid=?",
@@ -204,7 +208,7 @@ class ThingsMirror:
             conn.execute(
                 "INSERT INTO entities(uuid, entity, tp, payload, last_index, deleted) "
                 "VALUES(?,?,?,?,?,?)",
-                (uuid, entity, tp, json.dumps(payload), idx, int(is_tombstone)),
+                (uuid, entity, tp, json.dumps(payload), idx, int(is_delete)),
             )
             return
 
@@ -216,7 +220,7 @@ class ThingsMirror:
             merged.update(p)
             new_entity = row["entity"] or entity
         new_tp = merged.get("tp", row["tp"])
-        deleted = 1 if is_tombstone else row["deleted"]
+        deleted = 1 if is_delete else row["deleted"]
         conn.execute(
             "UPDATE entities SET entity=?, tp=?, payload=?, last_index=?, deleted=? "
             "WHERE uuid=?",
