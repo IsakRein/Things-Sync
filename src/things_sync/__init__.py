@@ -1,4 +1,4 @@
-from ._cloud import CloudAuthError, CloudError, ThingsCloud
+from ._cloud import CloudAuthError, CloudError, ThingsCloud, new_uuid
 from ._db import ThingsDB
 from ._mirror import ThingsMirror
 from .models import Area, Contact, Heading, ListInfo, Project, StartBucket, Status, Tag, Todo
@@ -20,4 +20,5 @@ __all__ = [
     "ListInfo",
     "Status",
     "StartBucket",
+    "new_uuid",
 ]
