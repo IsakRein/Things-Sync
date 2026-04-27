@@ -20,6 +20,7 @@ import json
 import os
 import secrets
 import threading
+import time as _time
 from dataclasses import dataclass
 from datetime import date as Date
 from datetime import datetime, time, timezone
@@ -427,24 +428,41 @@ class ThingsCloud:
                     out[uuid].update(p)
         return out
 
-    def commit(self, item_uuid: str, body: dict[str, Any], *, _retry: int = 1) -> int:
-        """POST /commit. On stale ancestor (409/410/412) refresh + retry once."""
+    def commit(self, item_uuid: str, body: dict[str, Any], *, _retry: int = 4) -> int:
+        """POST /commit. Refresh head + retry on stale-ancestor (409/410/412).
+
+        ``atlas watch`` and Things' Mac/iOS sync pollers can commit
+        concurrently — a single retry isn't enough when Mac is in a
+        burst. We do up to ``_retry`` attempts with short backoff
+        (50/150/350/750 ms) before raising.
+        """
+        import random as _random
         with self._lock:
-            params = {"ancestor-index": str(self.state.head_index), "_cnt": "1"}
-            payload = {item_uuid: body}
-            r = self._client.post("/commit", params=params, json=payload)
-            if r.status_code in (409, 410, 412) and _retry > 0:
-                self.refresh_head()
-                return self.commit(item_uuid, body, _retry=_retry - 1)
-            if r.status_code >= 400:
-                raise CloudError(f"Commit failed [{r.status_code}]: {r.text[:300]}")
-            data = r.json()
-            new_head = int(data["server-head-index"])
-            self.state.head_index = new_head
-            self.state.save()
-            if self._commit_hook is not None:
-                self._commit_hook(item_uuid, body, new_head)
-            return new_head
+            for attempt in range(_retry + 1):
+                params = {"ancestor-index": str(self.state.head_index), "_cnt": "1"}
+                payload = {item_uuid: body}
+                r = self._client.post("/commit", params=params, json=payload)
+                if r.status_code in (409, 410, 412) and attempt < _retry:
+                    self.refresh_head()
+                    # Exponential backoff with jitter so concurrent watchers
+                    # / pollers don't dogpile the same head_index.
+                    sleep_s = 0.05 * (3 ** attempt) + _random.uniform(0, 0.05)
+                    _time.sleep(sleep_s)
+                    continue
+                if r.status_code >= 400:
+                    raise CloudError(
+                        f"Commit failed [{r.status_code}] after "
+                        f"{attempt + 1} attempt(s): {r.text[:300]}"
+                    )
+                data = r.json()
+                new_head = int(data["server-head-index"])
+                self.state.head_index = new_head
+                self.state.save()
+                if self._commit_hook is not None:
+                    self._commit_hook(item_uuid, body, new_head)
+                return new_head
+            # unreachable — loop either returns or raises
+            raise CloudError("commit: exhausted retries without resolving")
 
     # ---- create ----
 
