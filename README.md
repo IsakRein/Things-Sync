@@ -1,21 +1,26 @@
 # things-sync
 
-Python wrapper for Things 3. Three layers stacked by what each is best at:
+Python wrapper for Things 3. Four layers stacked by what each is best at:
 
 - **`ThingsCloud`** — direct HTTP to `cloud.culturedcode.com`. Every
   write goes through here. Authoritative the moment the POST returns;
   Mac sees the change on its next sync pull. Works without Things
   running. Needs `THINGS_EMAIL` + `THINGS_PASSWORD`.
-- **`ThingsDB`** — read-only SQLite at disk speed. Every read goes
-  through here.
+- **`ThingsDB`** — read-only SQLite at disk speed, reading Things'
+  own database. Fast, but only sees what Things.app has synced.
+- **`ThingsMirror`** — local SQLite cache of the cloud commit stream.
+  Same shape as `ThingsDB`, but reads come from cloud history we
+  pull and replay ourselves — no dependency on Things being open or
+  caught up. Writes feed it through a hook so reads see them
+  immediately.
 - **`Things`** — façade that routes calls to the right layer above.
   Falls back to AppleScript only for UI nudges (`show`, `edit`, quick
   entry, launch/quit), `selected_todos`, the few ops cloud doesn't
   cover yet (tag/contact create, area edit, tag edit), and
   `empty_trash`.
 
-Mac requires Things 3 installed for SQLite reads + AS UI ops.
-`ThingsCloud` works standalone from any machine.
+`ThingsCloud` and `ThingsMirror` work standalone from any machine.
+`ThingsDB` and the AS-only ops in `Things` need Things 3 installed.
 
 ## Install
 
@@ -199,6 +204,47 @@ CloudKit sync. The DB is WAL-mode so reading while the app is running is
 safe. Pass `ThingsDB(path=…)` if your install lives in a non-standard
 container.
 
+## Cloud-direct reads (`ThingsMirror`)
+
+`ThingsDB` reads from Things' SQLite, so it only sees what Things.app
+has synced — and only on a Mac with Things installed. `ThingsMirror`
+skips Things entirely: it pulls the same commit stream cloud pushes to
+every device, replays it into a local SQLite we own
+(`~/.cache/things-sync/mirror.sqlite`), and serves the same
+dataclasses `ThingsDB` does.
+
+```python
+from things_sync import ThingsCloud, ThingsMirror
+
+with ThingsCloud.from_env() as cloud:
+    m = ThingsMirror(cloud)          # auto-wires the write hook
+    m.pull()                         # catch up from cloud history
+    m.todos()                        # disk-speed reads, no Things.app
+
+    uuid = cloud.add_todo("Buy milk")
+    m.todo(uuid)                     # visible immediately
+```
+
+Same surface as `ThingsDB` — `todos / projects / headings / areas /
+tags`, by-id lookups, `todos_in_project / todos_in_area /
+todos_under_heading / todos_with_tag`, `count_*`, `exists`. Call sites
+that already use `ThingsDB` can swap to `ThingsMirror` with no other
+changes.
+
+`pull()` is incremental and idempotent. Cloud-side history is
+server-compacted, so even on accounts with thousands of historical
+commits a fresh `reset()` replays in a handful of items.
+
+The mirror's cursor (`applied_index`) lives in the mirror DB,
+separate from `CloudState.head_index` (the write-side ancestor
+cursor). It auto-wipes on cloud-account change, the same protection
+`CloudState` has.
+
+Construction registers `cloud._commit_hook = mirror._on_commit`, so
+every successful write also lands in the mirror — reads see writes
+immediately, no fetch round-trip and no sync wait. Pass
+`attach=False` to opt out.
+
 ## Models
 
 Frozen dataclasses in `things_sync.models`: `Todo`, `Project`, `Heading`,
@@ -250,20 +296,20 @@ account's history-key, current head index, and our app-instance-id.
 
 Cloud writes are authoritative on the server immediately, but
 `ThingsDB` reads reflect Things' local SQLite, which lags by Mac's
-sync poll cycle (~5-15s foreground, up to ~3 min idle). For tests or
-scripts that care:
+sync poll cycle (~5-15s foreground, up to ~3 min idle). Three ways
+to bridge the gap, depending on the read path:
 
-```python
-t = Things(sync_after_write=True)   # blocks each write until uuid lands locally
-```
+- **`ThingsMirror`** (preferred for new code) — the write hook lands
+  every commit locally too, so reads from the mirror see the new
+  state immediately. No Things.app, no sync wait.
+- `Things(sync_after_write=True)` — blocks each write until the uuid
+  lands in Things' SQLite. Uses `Things.launch()` (= `tell ... to
+  activate`) which forces an immediate poll and drops the round trip
+  to ~2.5s; downside is it foregrounds Things on every write.
+- `Things().launch()` ad-hoc — same trick, one-shot.
 
-This calls `Things.launch()` (= `tell ... to activate`) after every
-cloud write, which forces an immediate poll and drops the round trip
-to ~2.5s. Off by default; in interactive use you usually don't need
-to read back what you just wrote.
-
-You can also nudge a single sync ad-hoc with `Things().launch()`
-without committing to per-write blocking.
+Mirror reads sidestep this entirely; the others are still useful when
+the consumer already reads from `ThingsDB` or doesn't run a mirror.
 
 ## Known AppleScript limits
 
@@ -319,8 +365,9 @@ src/things_sync/
   __init__.py     — public exports
   models.py       — dataclasses
   things.py       — Things class (façade + AS-only ops)
-  _db.py          — ThingsDB (read-only SQLite)
-  _cloud.py       — ThingsCloud (HTTP write client)
+  _db.py          — ThingsDB (read-only SQLite, Things' own DB)
+  _cloud.py       — ThingsCloud (HTTP read+write client)
+  _mirror.py      — ThingsMirror (cloud-direct local SQLite cache)
   _osascript.py   — osascript runner + delimited-output parser
   _scripts.py     — AppleScript prelude + per-class serializers
 ```

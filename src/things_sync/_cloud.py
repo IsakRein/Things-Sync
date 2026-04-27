@@ -363,6 +363,12 @@ class ThingsCloud:
         if self.state.head_index == 0:
             self.refresh_head()
 
+        # Optional callback invoked after every successful commit. Used by
+        # :class:`ThingsMirror` to keep its local SQLite cache in sync with
+        # writes without round-tripping through ``fetch``. Signature:
+        # ``(uuid, body, new_head_index)``.
+        self._commit_hook = None  # type: ignore[var-annotated]
+
     @classmethod
     def from_env(cls) -> "ThingsCloud":
         return cls(Account.login(Credentials.from_env()))
@@ -435,6 +441,8 @@ class ThingsCloud:
             new_head = int(data["server-head-index"])
             self.state.head_index = new_head
             self.state.save()
+            if self._commit_hook is not None:
+                self._commit_hook(item_uuid, body, new_head)
             return new_head
 
     # ---- create ----
