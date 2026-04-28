@@ -1,38 +1,23 @@
 """Public Python API: a single ``Things`` class.
 
-Three layers stacked underneath:
+Two layers stacked underneath:
 
-- **Writes** → :class:`ThingsCloud` (HTTP commits to ``cloud.culturedcode.com``).
-  Authoritative the moment the POST returns. Propagates to all devices
-  including this Mac on the next sync pull.
+- **Writes** → AppleScript via ``osascript``. Synchronous against Things'
+  local store: a write returns once Things has committed it to TMTask,
+  so a follow-up :class:`ThingsDB` read sees it immediately.
 - **Reads** → :class:`ThingsDB` (read-only SQLite at disk speed).
-  Reflects whatever has landed in Things' local store; lags writes by
-  a few seconds typical, up to ~3 min when Things is idle.
-- **AppleScript** — kept for UI nudges and the small surface that
-  Cloud doesn't yet cover (creating tags / contacts, parse-quicksilver,
-  empty-trash, the virtual built-in lists, currently-selected todos).
 
-After a Cloud write, ``Things.launch()`` (= ``tell ... to activate``)
-forces an immediate poll, dropping read-after-write to ~2.5s. Useful
-for tests; in interactive use, just rely on Things' normal polling.
+Things 3 must be installed and running on the local Mac. There is no
+networked / cloud-direct write path.
 """
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from enum import Enum
 from typing import Iterable
 
 from . import _osascript as osa
-from ._cloud import (
-    DEST_ANYTIME as _DEST_ANYTIME,
-    DEST_INBOX as _DEST_INBOX,
-    DEST_SOMEDAY as _DEST_SOMEDAY,
-    STATUS_CANCELLED as _CLOUD_STATUS_CANCELLED,
-    STATUS_COMPLETE as _CLOUD_STATUS_COMPLETE,
-    STATUS_OPEN as _CLOUD_STATUS_OPEN,
-    ThingsCloud,
-)
 from ._db import ThingsDB
 from ._osascript import US, as_date, as_str, parse_iso, parse_records
 from ._scripts import script
@@ -41,10 +26,10 @@ from .models import Area, Contact, Heading, ListInfo, Project, Status, Tag, Todo
 TELL = 'application id "com.culturedcode.ThingsMac"'
 BUILTIN_LISTS = ("Inbox", "Today", "Anytime", "Upcoming", "Someday", "Logbook", "Trash")
 
-_STATUS_TO_CLOUD = {
-    Status.OPEN: _CLOUD_STATUS_OPEN,
-    Status.CANCELED: _CLOUD_STATUS_CANCELLED,
-    Status.COMPLETED: _CLOUD_STATUS_COMPLETE,
+_STATUS_AS = {
+    Status.OPEN: "open",
+    Status.COMPLETED: "completed",
+    Status.CANCELED: "canceled",
 }
 
 
@@ -75,74 +60,17 @@ def _to_dt(v: date | datetime | str | None) -> datetime | None:
     return datetime(v.year, v.month, v.day)
 
 
-def _looks_like_uuid(s: str) -> bool:
-    """Heuristic: 21-22 chars, all alphanumeric. Used to distinguish a tag
-    UUID from a tag name when we accept either at the API surface."""
-    return 21 <= len(s) <= 22 and s.isalnum()
-
-
 class Things:
-    """Façade exposing Things' state and ops with sensible per-op routing.
+    """Façade over Things 3. Writes via AppleScript; reads via SQLite."""
 
-    Writes go through :attr:`cloud` (HTTP). Reads come from :attr:`db`
-    (SQLite). UI and a few special-case ops use AppleScript.
-
-    Cloud and DB are lazy: no network or DB I/O until the first call
-    that needs them. ``THINGS_EMAIL`` + ``THINGS_PASSWORD`` are required
-    in the environment as soon as any write or :attr:`cloud` access
-    happens; reads work without them.
-    """
-
-    def __init__(self, *, sync_after_write: bool = False, sync_timeout: float = 30.0) -> None:
-        """Create a Things facade.
-
-        ``sync_after_write=True`` makes every cloud write call
-        :meth:`launch` and poll the local DB until the change lands —
-        useful for tests / scripts that want read-after-write
-        consistency. Costs ~1-3s per write and may steal focus.
-        Off by default; in interactive use you'll just see the change
-        after Things' next normal poll.
-        """
-        self._cloud: ThingsCloud | None = None
+    def __init__(self) -> None:
         self._db: ThingsDB | None = None
-        self._sync_after_write = sync_after_write
-        self._sync_timeout = sync_timeout
-
-    @property
-    def cloud(self) -> ThingsCloud:
-        if self._cloud is None:
-            self._cloud = ThingsCloud.from_env()
-        return self._cloud
 
     @property
     def db(self) -> ThingsDB:
         if self._db is None:
             self._db = ThingsDB()
         return self._db
-
-    def _resolve_tags(self, tags: Iterable[str] | None) -> list[str]:
-        """Map tag names → tag UUIDs using the local DB. UUIDs pass through.
-
-        Cloud commits expect ``tg: [<uuid>, ...]``; the public API has
-        always taken names because that matched the AppleScript surface.
-        Anything that doesn't already look like a UUID gets resolved by
-        a name lookup against ``ThingsDB.tag(name)``.
-        """
-        if not tags:
-            return []
-        out = []
-        for t in tags:
-            if _looks_like_uuid(t):
-                out.append(t)
-                continue
-            tag = self.db.tag(t)
-            if tag is None:
-                raise ValueError(
-                    f"Tag {t!r} not found in local DB — create it (via "
-                    f"create_tag) or pass its UUID directly."
-                )
-            out.append(tag.id)
-        return out
 
     # ------------------------------------------------------------------ meta
 
@@ -160,9 +88,7 @@ class Things:
         osa.run(f"tell {TELL} to quit")
 
     def launch(self) -> None:
-        """``tell ... to activate``. Brings Things to foreground and triggers
-        an immediate cloud poll — useful right after a cloud write to fast-
-        forward the local SQLite copy (~2.5s end-to-end)."""
+        """``tell ... to activate``. Brings Things to foreground."""
         osa.run(f"tell {TELL} to activate")
 
     # --------------------------------------------------------- bulk reads (DB)
@@ -186,8 +112,7 @@ class Things:
         return self.db.headings()
 
     def lists(self) -> list[ListInfo]:
-        """Built-in lists. The ids are stable identifiers Things uses
-        internally; we return them by name since the AS ``lists``
+        """Built-in lists. Returned by name since the AS ``lists``
         collection is broken on Things 3.22.11."""
         return [ListInfo(id=name, name=name) for name in BUILTIN_LISTS]
 
@@ -223,7 +148,6 @@ class Things:
         return self.db.todos_in_list(name)
 
     def selected_todos(self) -> list[Todo]:
-        """Currently-selected todos in Things UI — only available via AS."""
         body = f"""
         tell {TELL}
             set out to ""
@@ -268,32 +192,34 @@ class Things:
         tags: Iterable[str] | None = None,
         project: str | None = None,
         area: str | None = None,
-        heading: str | None = None,
         contact: str | None = None,
     ) -> Todo:
-        """Create a todo via Cloud HTTP. Returns the constructed dataclass."""
+        props = [f"name:{as_str(name)}"]
+        if notes is not None:
+            props.append(f"notes:{as_str(notes)}")
+        if deadline is not None:
+            props.append(f"due date:{as_date(deadline)}")
+        if tags:
+            props.append(f"tag names:{as_str(_csv_tags(tags))}")
+        record = "{" + ", ".join(props) + "}"
+        post: list[str] = []
+        if project is not None:
+            post.append(f"move t to project id {as_str(project)}")
+        elif area is not None:
+            post.append(f"move t to area id {as_str(area)}")
+        if when is not None:
+            post.append(f"schedule t for {as_date(when)}")
         if contact is not None:
-            raise NotImplementedError(
-                "Cloud wire format for contact assignment isn't captured yet — "
-                "create the todo first, then attach via AppleScript if needed."
-            )
-        tag_uuids = self._resolve_tags(tags)
-        uuid = self.cloud.add_todo(
-            name, notes=notes or "", when=when, deadline=deadline,
-            project=project, area=area, heading=heading,
-            tags=tag_uuids,
-        )
-        self._settle(uuid)
-        now = datetime.now()
-        return Todo(
-            id=uuid, name=name, notes=notes or "",
-            due_date=_to_dt(deadline),
-            activation_date=_to_dt(when),
-            creation_date=now, modification_date=now,
-            tag_names=tuple(tags or ()),
-            project_id=project, area_id=area, contact_id=None,
-            heading_id=heading,
-        )
+            post.append(f"set contact of t to contact id {as_str(contact)}")
+        post_block = "\n            ".join(post)
+        body = f"""
+        tell {TELL}
+            set t to make new to do with properties {record}
+            {post_block}
+            return my serializeTodo(t)
+        end tell
+        """
+        return _parse_todo(osa.run(script(body)).split(US))
 
     def create_project(
         self,
@@ -305,23 +231,28 @@ class Things:
         tags: Iterable[str] | None = None,
         area: str | None = None,
     ) -> Project:
-        tag_uuids = self._resolve_tags(tags)
-        uuid = self.cloud.add_project(
-            name, notes=notes or "", deadline=deadline, area=area, tags=tag_uuids,
-        )
-        # Cloud has no `when` arg on create — schedule afterward if requested.
+        props = [f"name:{as_str(name)}"]
+        if notes is not None:
+            props.append(f"notes:{as_str(notes)}")
+        if deadline is not None:
+            props.append(f"due date:{as_date(deadline)}")
+        if tags:
+            props.append(f"tag names:{as_str(_csv_tags(tags))}")
+        record = "{" + ", ".join(props) + "}"
+        post: list[str] = []
+        if area is not None:
+            post.append(f"move p to area id {as_str(area)}")
         if when is not None:
-            self.cloud.edit(uuid, when=when)
-        self._settle(uuid)
-        now = datetime.now()
-        return Project(
-            id=uuid, name=name, notes=notes or "",
-            due_date=_to_dt(deadline),
-            activation_date=_to_dt(when),
-            creation_date=now, modification_date=now,
-            tag_names=tuple(tags or ()),
-            area_id=area,
-        )
+            post.append(f"schedule p for {as_date(when)}")
+        post_block = "\n            ".join(post)
+        body = f"""
+        tell {TELL}
+            set p to make new project with properties {record}
+            {post_block}
+            return my serializeProject(p)
+        end tell
+        """
+        return _parse_project(osa.run(script(body)).split(US))
 
     def create_area(
         self,
@@ -329,21 +260,17 @@ class Things:
         *,
         tags: Iterable[str] | None = None,
     ) -> Area:
-        uuid = self.cloud.add_area(name)
-        # Cloud area payload doesn't carry tags (we haven't reverse-engineered
-        # that yet). Leave tags off for now.
+        props = [f"name:{as_str(name)}"]
         if tags:
-            raise NotImplementedError(
-                "Tag assignment on Cloud-created areas isn't wired yet."
-            )
-        self._settle(uuid)
-        return Area(id=uuid, name=name, tag_names=(), collapsed=False)
-
-    def create_heading(self, name: str, *, project: str) -> Heading:
-        """Create a heading inside ``project``. Cloud-only — AS has no API."""
-        uuid = self.cloud.add_heading(name, project=project)
-        self._settle(uuid)
-        return Heading(id=uuid, name=name, project_id=project, status=Status.OPEN)
+            props.append(f"tag names:{as_str(_csv_tags(tags))}")
+        record = "{" + ", ".join(props) + "}"
+        body = f"""
+        tell {TELL}
+            set a to make new area with properties {record}
+            return my serializeArea(a)
+        end tell
+        """
+        return _parse_area(osa.run(script(body)).split(US))
 
     def create_tag(
         self,
@@ -352,7 +279,6 @@ class Things:
         parent: str | None = None,
         shortcut: str | None = None,
     ) -> Tag:
-        """Create a tag — kept on AppleScript; Cloud wire format not captured."""
         props = [f"name:{as_str(name)}"]
         if shortcut is not None:
             props.append(f"keyboard shortcut:{as_str(shortcut)}")
@@ -370,7 +296,6 @@ class Things:
         return _parse_tag(osa.run(script(body)).split(US))
 
     def create_contact(self, name: str) -> Contact:
-        """Create a contact — kept on AppleScript; Cloud wire format not captured."""
         body = f"""
         tell {TELL}
             set c to add contact named {as_str(name)}
@@ -380,7 +305,7 @@ class Things:
         return _parse_contact(osa.run(script(body)).split(US))
 
     def parse_quicksilver(self, text: str) -> Todo:
-        """Pop the Quick Entry parser — UI-only feature, AS only."""
+        """Pop the Quick Entry parser — UI-only feature."""
         body = f"""
         tell {TELL}
             set t to parse quicksilver input {as_str(text)}
@@ -402,34 +327,52 @@ class Things:
         status: Status | None = None,
         project: str | None | _Sentinel = UNSET,  # type: ignore[name-defined]
         area: str | None | _Sentinel = UNSET,  # type: ignore[name-defined]
-        heading: str | None | _Sentinel = UNSET,  # type: ignore[name-defined]
         contact: str | None | _Sentinel = UNSET,  # type: ignore[name-defined]
     ) -> Todo:
-        if contact is not UNSET:
-            raise NotImplementedError("Contact assignment via Cloud not wired yet.")
-        kwargs: dict = {}
+        if due_date is None:
+            raise NotImplementedError(
+                "Clearing a due date isn't supported: AppleScript refuses "
+                "missing-value for date-typed properties. Clear it from the "
+                "Things UI."
+            )
+        sets: list[str] = []
         if name is not None:
-            kwargs["title"] = name
+            sets.append(f"set name of t to {as_str(name)}")
         if notes is not None:
-            kwargs["notes"] = notes
+            sets.append(f"set notes of t to {as_str(notes)}")
         if due_date is not UNSET:
-            kwargs["deadline"] = due_date
+            sets.append(f"set due date of t to {as_date(due_date)}")
         if tags is not None:
-            kwargs["tags"] = self._resolve_tags(tags)
+            sets.append(f"set tag names of t to {as_str(_csv_tags(tags))}")
         if status is not None:
-            kwargs["status"] = _STATUS_TO_CLOUD[status]
+            sets.append(f"set status of t to {_STATUS_AS[status]}")
         if project is not UNSET:
-            kwargs["project"] = project
+            if project is None:
+                sets.append('move t to list "Inbox"')
+            else:
+                sets.append(f"move t to project id {as_str(project)}")
         if area is not UNSET:
-            kwargs["area"] = area
-        if heading is not UNSET:
-            kwargs["heading"] = heading
-        if kwargs:
-            self.cloud.edit(id, **kwargs)
-            self._settle(id)
+            if area is None:
+                sets.append('move t to list "Inbox"')
+            else:
+                sets.append(f"move t to area id {as_str(area)}")
+        if contact is not UNSET:
+            if contact is None:
+                sets.append("set contact of t to missing value")
+            else:
+                sets.append(f"set contact of t to contact id {as_str(contact)}")
+        if sets:
+            sets_block = "\n            ".join(sets)
+            body = f"""
+            tell {TELL}
+                set t to to do id {as_str(id)}
+                {sets_block}
+            end tell
+            """
+            osa.run(script(body))
         return self._effective_todo(id, name=name, notes=notes, due_date=due_date,
                                     tags=tags, status=status, project=project,
-                                    area=area, heading=heading)
+                                    area=area)
 
     def update_project(
         self,
@@ -442,32 +385,41 @@ class Things:
         status: Status | None = None,
         area: str | None | _Sentinel = UNSET,  # type: ignore[name-defined]
     ) -> Project:
-        kwargs: dict = {}
+        if due_date is None:
+            raise NotImplementedError(
+                "Clearing a due date isn't supported: AppleScript refuses "
+                "missing-value for date-typed properties. Clear it from the "
+                "Things UI."
+            )
+        sets: list[str] = []
         if name is not None:
-            kwargs["title"] = name
+            sets.append(f"set name of p to {as_str(name)}")
         if notes is not None:
-            kwargs["notes"] = notes
+            sets.append(f"set notes of p to {as_str(notes)}")
         if due_date is not UNSET:
-            kwargs["deadline"] = due_date
+            sets.append(f"set due date of p to {as_date(due_date)}")
         if tags is not None:
-            kwargs["tags"] = self._resolve_tags(tags)
+            sets.append(f"set tag names of p to {as_str(_csv_tags(tags))}")
         if status is not None:
-            kwargs["status"] = _STATUS_TO_CLOUD[status]
+            sets.append(f"set status of p to {_STATUS_AS[status]}")
         if area is not UNSET:
-            kwargs["area"] = area
-        if kwargs:
-            self.cloud.edit(id, **kwargs)
-            self._settle(id)
+            if area is None:
+                sets.append("set area of p to missing value")
+            else:
+                sets.append(f"move p to area id {as_str(area)}")
+        if sets:
+            sets_block = "\n            ".join(sets)
+            body = f"""
+            tell {TELL}
+                set p to project id {as_str(id)}
+                {sets_block}
+                return my serializeProject(p)
+            end tell
+            """
+            return _parse_project(osa.run(script(body)).split(US))
+        # No change — read current.
         base = self.db.project(id, include_trashed=True) or Project(id=id, name=name or "")
-        return replace(
-            base,
-            **({"name": name} if name is not None else {}),
-            **({"notes": notes} if notes is not None else {}),
-            **({"due_date": _to_dt(due_date)} if due_date is not UNSET else {}),
-            **({"tag_names": tuple(tags)} if tags is not None else {}),
-            **({"status": status} if status is not None else {}),
-            **({"area_id": area} if area is not UNSET else {}),
-        )
+        return base
 
     def update_area(
         self,
@@ -477,8 +429,7 @@ class Things:
         tags: Iterable[str] | None = None,
         collapsed: bool | None = None,
     ) -> Area:
-        """Update an area — AS-only (Cloud wire format for Area3 edits not captured)."""
-        sets = []
+        sets: list[str] = []
         if name is not None:
             sets.append(f"set name of a to {as_str(name)}")
         if tags is not None:
@@ -503,8 +454,7 @@ class Things:
         shortcut: str | None = None,
         parent: str | None | _Sentinel = UNSET,  # type: ignore[name-defined]
     ) -> Tag:
-        """Rename / re-shortcut / re-parent a tag — AS-only."""
-        sets = []
+        sets: list[str] = []
         if name is not None:
             sets.append(f"set name of g to {as_str(name)}")
         if shortcut is not None:
@@ -527,102 +477,148 @@ class Things:
     # ---------------------------------------------------------- status moves
 
     def complete(self, id: str) -> Todo:
-        self.cloud.complete(id)
-        self._settle(id)
+        body = f"""
+        tell {TELL}
+            set t to to do id {as_str(id)}
+            set status of t to completed
+        end tell
+        """
+        osa.run(script(body))
         return self._effective_todo(id, status=Status.COMPLETED, _completed_now=True)
 
     def cancel(self, id: str) -> Todo:
-        self.cloud.cancel(id)
-        self._settle(id)
+        body = f"""
+        tell {TELL}
+            set t to to do id {as_str(id)}
+            set status of t to canceled
+        end tell
+        """
+        osa.run(script(body))
         return self._effective_todo(id, status=Status.CANCELED, _canceled_now=True)
 
     def reopen(self, id: str) -> Todo:
-        self.cloud.reopen(id)
-        self._settle(id)
+        body = f"""
+        tell {TELL}
+            set t to to do id {as_str(id)}
+            set status of t to open
+        end tell
+        """
+        osa.run(script(body))
         return self._effective_todo(id, status=Status.OPEN, _reopen=True)
 
     def move_to_list(self, id: str, list_name: str) -> None:
-        """Move a todo to a built-in list via Cloud verbs.
+        """Move a todo to a built-in list.
 
-        The lists are virtual — there's no list to "move" to, so we
-        translate to the canonical operation:
-
-        - Inbox: clear project/area/heading, set destination=INBOX
-        - Today: schedule for today (sr=today; UI shows it under Today)
-        - Anytime: clear schedule, destination=ANYTIME
-        - Someday: destination=SOMEDAY
+        - Inbox: clear project/area, drop into Inbox
+        - Today: schedule for today (Things shows it under Today)
+        - Anytime / Someday: route via the AS ``list`` reference
+        - Trash: ``delete`` (soft, recoverable until empty_trash)
         - Logbook: complete (Things archives completed items there)
-        - Trash: trash
 
-        ``Upcoming`` isn't a destination — it's auto-derived from a future
-        schedule date — so use :meth:`schedule` directly with that date.
+        ``Upcoming`` is derived from a future scheduled date — use
+        :meth:`schedule` directly with that date.
         """
         n = list_name.lower()
-        if n == "inbox":
-            self.cloud.edit(id, project=None, area=None, heading=None,
-                            destination=_DEST_INBOX)
-        elif n == "today":
-            self.cloud.edit(id, when=date.today())
-        elif n == "anytime":
-            self.cloud.edit(id, when=None, destination=_DEST_ANYTIME)
-        elif n == "someday":
-            self.cloud.edit(id, destination=_DEST_SOMEDAY)
-        elif n == "trash":
-            self.cloud.trash(id)
-        elif n == "logbook":
-            self.cloud.complete(id)
-        elif n == "upcoming":
+        if n == "upcoming":
             raise ValueError(
                 "Upcoming is derived from a future scheduled date; use "
                 "Things.schedule(id, future_date) instead."
             )
+        if n == "today":
+            body = f"""
+            tell {TELL}
+                set t to to do id {as_str(id)}
+                schedule t for current date
+            end tell
+            """
+        elif n == "trash":
+            body = f"""
+            tell {TELL}
+                delete (to do id {as_str(id)})
+            end tell
+            """
+        elif n == "logbook":
+            body = f"""
+            tell {TELL}
+                set status of (to do id {as_str(id)}) to completed
+            end tell
+            """
+        elif n in ("inbox", "anytime", "someday"):
+            target = list_name.capitalize()
+            body = f"""
+            tell {TELL}
+                move (to do id {as_str(id)}) to list {as_str(target)}
+            end tell
+            """
         else:
             raise ValueError(
                 f"unknown list {list_name!r}; expected Inbox/Today/Anytime/"
                 "Someday/Logbook/Trash"
             )
-        self._settle(id)
+        osa.run(script(body))
 
     def move_to_area(self, id: str, area_id: str) -> None:
-        self.cloud.edit(id, area=area_id)
-        self._settle(id)
+        body = f"""
+        tell {TELL}
+            move (to do id {as_str(id)}) to area id {as_str(area_id)}
+        end tell
+        """
+        osa.run(script(body))
 
     def move_to_project(self, id: str, project_id: str) -> None:
-        self.cloud.edit(id, project=project_id)
-        self._settle(id)
+        body = f"""
+        tell {TELL}
+            move (to do id {as_str(id)}) to project id {as_str(project_id)}
+        end tell
+        """
+        osa.run(script(body))
 
     def schedule(self, id: str, when: date | datetime | str) -> None:
-        self.cloud.edit(id, when=when)
-        self._settle(id)
+        body = f"""
+        tell {TELL}
+            schedule (to do id {as_str(id)}) for {as_date(when)}
+        end tell
+        """
+        osa.run(script(body))
 
     # -------------------------------------------------------------- deletion
 
     def delete(self, id: str) -> None:
-        """Soft-delete via Cloud (sets ``tr=True``). Recoverable until empty_trash."""
-        self.cloud.trash(id)
-        self._settle(id, gone=True)
+        """Soft-delete to Trash (recoverable until ``empty_trash``).
 
-    def trash_heading(self, id: str) -> None:
-        self.cloud.trash_heading(id)
-        self._settle(id, gone=True)
+        Works for todos, projects, areas, and tags. Things' AS ``delete``
+        verb routes the item to the Trash (todos/projects) or removes it
+        outright (areas/tags).
+        """
+        body = f"""
+        tell {TELL}
+            try
+                delete (to do id {as_str(id)})
+                return
+            end try
+            try
+                delete (project id {as_str(id)})
+                return
+            end try
+            try
+                delete (area id {as_str(id)})
+                return
+            end try
+            try
+                delete (tag id {as_str(id)})
+                return
+            end try
+        end tell
+        """
+        osa.run(script(body))
 
     def empty_trash(self) -> None:
-        """Hard-delete trashed items — AS only (Cloud has no purge verb)."""
         osa.run(f"tell {TELL} to empty trash")
 
     def delete_immediately(self, id: str) -> None:
-        """Soft-trash via Cloud, then empty Trash via AS to purge."""
-        self.cloud.trash(id)
-        # Empty trash needs Things to have ingested the trash first.
-        # The AS empty_trash works on whatever's currently in Trash, so a
-        # quick activate-then-empty gets it. Caller should ensure the
-        # Cloud trash has propagated (e.g. via launch+wait) for the
-        # specific item to be purged.
+        """Soft-trash, then empty Trash to purge."""
+        self.delete(id)
         self.empty_trash()
-
-    def clear_due_date(self, id: str) -> None:
-        """Clear an item's due date — Cloud-only (AS refuses missing-value dates)."""
-        self.cloud.clear_due_date(id)
 
     # -------------------------------------------------------------------- UI
 
@@ -679,37 +675,9 @@ class Things:
     # -------------------------------------------------------------- maintenance
 
     def log_completed_now(self) -> None:
-        """Sweep completed items to Logbook — AS-only."""
         osa.run(f"tell {TELL} to log completed now")
 
     # ---------------------------------------------------------------- helpers
-
-    def _settle(self, id: str | None = None, *, gone: bool = False) -> None:
-        """If ``sync_after_write`` is on, force a poll and wait for the
-        local DB to reflect the change.
-
-        ``gone=True`` waits for the row to become inactive (trashed or
-        purged); otherwise waits for it to be active (present, not
-        trashed).
-        """
-        if not self._sync_after_write or id is None:
-            return
-        import time
-        self.launch()  # force foreground poll
-        deadline = time.monotonic() + self._sync_timeout
-        while time.monotonic() < deadline:
-            active = (
-                self.db.todo(id, include_trashed=False) is not None
-                or self.db.project(id, include_trashed=False) is not None
-                or self.db.heading(id, include_trashed=False) is not None
-                or self.db.area(id) is not None
-                or self.db.tag_by_id(id) is not None
-            )
-            if gone and not active:
-                return
-            if not gone and active:
-                return
-            time.sleep(0.25)
 
     def _effective_todo(
         self,
@@ -722,16 +690,11 @@ class Things:
         status: Status | None = None,
         project=UNSET,
         area=UNSET,
-        heading=UNSET,
         _completed_now: bool = False,
         _canceled_now: bool = False,
         _reopen: bool = False,
     ) -> Todo:
-        """Build the post-write Todo: read SQLite (may be stale), apply our patch.
-
-        Used by ``update_todo`` / ``complete`` / etc. to return a Todo that
-        reflects the *intended* state regardless of sync timing.
-        """
+        """Build the post-write Todo: read SQLite, apply the patch we just wrote."""
         base = self.db.todo(id, include_trashed=True) or Todo(id=id, name=name or "")
         patch: dict = {}
         if name is not None:
@@ -748,8 +711,6 @@ class Things:
             patch["project_id"] = project
         if area is not UNSET:
             patch["area_id"] = area
-        if heading is not UNSET:
-            patch["heading_id"] = heading
         if _completed_now:
             patch["completion_date"] = datetime.now()
         if _canceled_now:
@@ -761,8 +722,7 @@ class Things:
 
 
 # ---------------------------------------------------------------------- helpers
-# Parsers retained for AS-driven methods (lists, selected_todos,
-# parse_quicksilver, create_tag, create_contact, update_tag, update_area).
+# Parsers for AS-driven serialized output.
 
 
 def _parse_todo(r: list[str]) -> Todo:
@@ -781,6 +741,23 @@ def _parse_todo(r: list[str]) -> Todo:
         project_id=r[11] or None,
         area_id=r[12] or None,
         contact_id=r[13] or None,
+    )
+
+
+def _parse_project(r: list[str]) -> Project:
+    return Project(
+        id=r[0],
+        name=r[1],
+        notes=r[2],
+        status=Status(r[3]) if r[3] in Status._value2member_map_ else Status.OPEN,
+        due_date=parse_iso(r[4]),
+        activation_date=parse_iso(r[5]),
+        completion_date=parse_iso(r[6]),
+        cancellation_date=parse_iso(r[7]),
+        creation_date=parse_iso(r[8]),
+        modification_date=parse_iso(r[9]),
+        tag_names=_split_tags(r[10]),
+        area_id=r[11] or None,
     )
 
 

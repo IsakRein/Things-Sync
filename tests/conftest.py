@@ -1,13 +1,11 @@
 """Shared fixtures. Tests run against the live Things 3 sandbox.
 
-The fixture creates a ``Things(sync_after_write=True)`` so each cloud
-write is followed by ``launch()`` + a wait until the row lands in the
-local SQLite. That keeps "create then read by id" patterns working
-without per-test sleeps, at the cost of a few seconds per write.
+AppleScript writes are synchronous against Things' local store, so a
+write returns once Things has committed it to TMTask — no settle loop
+needed.
 
-Cleanup uses the local DB to find ``_ts_test_*`` leftovers and trashes
-them via Cloud. If sync hasn't caught up by the time cleanup runs, a
-few items will leak — they get caught by the next test session.
+Cleanup walks the local DB for ``_ts_test_*`` leftovers and trashes
+them.
 """
 from __future__ import annotations
 
@@ -23,7 +21,7 @@ PREFIX = "_ts_test_"
 
 @pytest.fixture
 def things() -> Iterator[Things]:
-    yield Things(sync_after_write=True, sync_timeout=60.0)
+    yield Things()
 
 
 @pytest.fixture(autouse=True)
@@ -46,13 +44,8 @@ def _cleanup(things: Things) -> Iterator[None]:
     for tag in db.tags():
         if tag.name.startswith(PREFIX):
             leftovers.append(tag.id)
-    if not leftovers:
-        return
-    try:
-        for uid in leftovers:
-            try:
-                things.cloud.trash(uid)
-            except Exception:  # noqa: BLE001
-                pass
-    except Exception:  # noqa: BLE001
-        pass
+    for uid in leftovers:
+        try:
+            things.delete(uid)
+        except Exception:  # noqa: BLE001
+            pass
