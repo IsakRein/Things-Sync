@@ -12,6 +12,8 @@ networked / cloud-direct write path.
 """
 from __future__ import annotations
 
+import time
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime
 from enum import Enum
@@ -204,13 +206,13 @@ class Things:
         record = "{" + ", ".join(props) + "}"
         post: list[str] = []
         if project is not None:
-            post.append(f"move t to project id {as_str(project)}")
+            post.append(f"set project of t to (project id {as_str(project)})")
         elif area is not None:
-            post.append(f"move t to area id {as_str(area)}")
+            post.append(f"set area of t to (area id {as_str(area)})")
         if when is not None:
             post.append(f"schedule t for {as_date(when)}")
         if contact is not None:
-            post.append(f"set contact of t to contact id {as_str(contact)}")
+            post.append(f"set contact of t to (contact id {as_str(contact)})")
         post_block = "\n            ".join(post)
         body = f"""
         tell {TELL}
@@ -241,7 +243,7 @@ class Things:
         record = "{" + ", ".join(props) + "}"
         post: list[str] = []
         if area is not None:
-            post.append(f"move p to area id {as_str(area)}")
+            post.append(f"set area of p to (area id {as_str(area)})")
         if when is not None:
             post.append(f"schedule p for {as_date(when)}")
         post_block = "\n            ".join(post)
@@ -350,17 +352,17 @@ class Things:
             if project is None:
                 sets.append('move t to list "Inbox"')
             else:
-                sets.append(f"move t to project id {as_str(project)}")
+                sets.append(f"set project of t to (project id {as_str(project)})")
         if area is not UNSET:
             if area is None:
                 sets.append('move t to list "Inbox"')
             else:
-                sets.append(f"move t to area id {as_str(area)}")
+                sets.append(f"set area of t to (area id {as_str(area)})")
         if contact is not UNSET:
             if contact is None:
                 sets.append("set contact of t to missing value")
             else:
-                sets.append(f"set contact of t to contact id {as_str(contact)}")
+                sets.append(f"set contact of t to (contact id {as_str(contact)})")
         if sets:
             sets_block = "\n            ".join(sets)
             body = f"""
@@ -406,7 +408,7 @@ class Things:
             if area is None:
                 sets.append("set area of p to missing value")
             else:
-                sets.append(f"move p to area id {as_str(area)}")
+                sets.append(f"set area of p to (area id {as_str(area)})")
         if sets:
             sets_block = "\n            ".join(sets)
             body = f"""
@@ -560,7 +562,8 @@ class Things:
     def move_to_area(self, id: str, area_id: str) -> None:
         body = f"""
         tell {TELL}
-            move (to do id {as_str(id)}) to area id {as_str(area_id)}
+            set t to to do id {as_str(id)}
+            set area of t to (area id {as_str(area_id)})
         end tell
         """
         osa.run(script(body))
@@ -568,7 +571,8 @@ class Things:
     def move_to_project(self, id: str, project_id: str) -> None:
         body = f"""
         tell {TELL}
-            move (to do id {as_str(id)}) to project id {as_str(project_id)}
+            set t to to do id {as_str(id)}
+            set project of t to (project id {as_str(project_id)})
         end tell
         """
         osa.run(script(body))
@@ -612,13 +616,44 @@ class Things:
         """
         osa.run(script(body))
 
-    def empty_trash(self) -> None:
-        osa.run(f"tell {TELL} to empty trash")
+    def empty_trash(self, *, timeout: float = 10.0) -> None:
+        """Purge all currently-trashed items.
 
-    def delete_immediately(self, id: str) -> None:
-        """Soft-trash, then empty Trash to purge."""
+        AS ``empty trash`` returns before Things has flushed the change
+        to its SQLite store, so we poll until no trashed rows remain
+        across todos, projects, and headings (or ``timeout`` elapses).
+        """
+        osa.run(f"tell {TELL} to empty trash")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._count_trashed() == 0:
+                return
+            time.sleep(0.1)
+
+    def _count_trashed(self) -> int:
+        with closing(self.db._connect()) as con:
+            (cnt,) = con.execute(
+                "SELECT COUNT(*) FROM TMTask WHERE trashed = 1"
+            ).fetchone()
+        return cnt
+
+    def delete_immediately(self, id: str, *, timeout: float = 10.0) -> None:
+        """Soft-trash, then empty Trash, then wait for the row to actually
+        leave the local SQLite store."""
         self.delete(id)
-        self.empty_trash()
+        osa.run(f"tell {TELL} to empty trash")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            gone = (
+                self.db.todo(id, include_trashed=True) is None
+                and self.db.project(id, include_trashed=True) is None
+                and self.db.heading(id, include_trashed=True) is None
+                and self.db.area(id) is None
+                and self.db.tag_by_id(id) is None
+            )
+            if gone:
+                return
+            time.sleep(0.1)
 
     # -------------------------------------------------------------------- UI
 

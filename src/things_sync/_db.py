@@ -378,10 +378,11 @@ class ThingsDB:
 
     def todos_with_tag(self, name: str, *, include_trashed: bool = False) -> list[Todo]:
         sql = """
-            SELECT TMTask.uuid AS uuid, title, notes, status, trashed,
-                   creationDate, userModificationDate, stopDate,
-                   start, startDate, deadline,
-                   project, area, contact, heading
+            SELECT TMTask.uuid AS uuid, TMTask.title AS title, TMTask.notes AS notes,
+                   TMTask.status AS status, TMTask.trashed AS trashed,
+                   TMTask.creationDate, TMTask.userModificationDate, TMTask.stopDate,
+                   TMTask.start, TMTask.startDate, TMTask.deadline,
+                   TMTask.project, TMTask.area, TMTask.contact, TMTask.heading
             FROM TMTask
             JOIN TMTaskTag ON TMTaskTag.tasks = TMTask.uuid
             JOIN TMTag ON TMTag.uuid = TMTaskTag.tags
