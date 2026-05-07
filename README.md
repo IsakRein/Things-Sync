@@ -56,7 +56,7 @@ t.empty_trash()          # purge
 | Area     | AS     | DB   | name, tags, collapsed | n/a | `delete` |
 | Tag      | AS     | DB   | name, shortcut, parent | n/a | `delete` |
 | Contact  | AS     | DB   | not exposed | n/a | not exposed |
-| Heading  | n/a    | DB   | n/a | n/a | n/a |
+| Heading  | Shortcut | DB | not exposed | n/a | `delete` |
 
 ### Editing semantics
 
@@ -186,11 +186,14 @@ Frozen dataclasses in `things_sync.models`: `Todo`, `Project`, `Heading`,
 The AS dictionary doesn't cover everything Things' UI exposes; we
 keep the wrapper to what AS can actually do reliably:
 
-- **No heading manipulation.** AS has no API for create/edit/trash
-  on headings. They're readable via `Things.headings()` /
-  `ThingsDB.headings()`, and todos already assigned to a heading
-  carry `heading_id` in reads — but creating, renaming, or moving
-  todos under headings has to be done in the Things UI.
+- **Headings: create via Shortcuts, delete via AS.** AppleScript
+  has no `make new heading` (raises -2753), so `Things.create_heading
+  (project_id, name)` shells out to `shortcuts run` against a
+  user-configured Shortcut named `Things-Sync Add Heading` (one-time
+  setup — see the docstring on `create_heading`). AS *can* delete
+  headings, so `Things.delete(heading_id)` works. Renaming or
+  moving todos under an existing heading still has to be done in
+  the Things UI.
 - **No programmatic date clearing.** AS rejects
   `set due date of t to missing value` for date-typed properties.
   `update_todo(id, due_date=None)` raises. Clear due dates from

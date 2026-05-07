@@ -320,19 +320,19 @@ class Things:
         One-time setup in Shortcuts.app:
           1. New Shortcut → name it exactly ``Things-Sync Add Heading``.
           2. Receive Shortcut Input as Text.
-          3. Split text by ``|`` → first match = project_id, second = title.
-          4. Things 3 → Find Project where ID matches ``project_id``.
-          5. Things 3 → Add Heading: title = the title text, Project = the
+          3. Split Text by **New Lines** → item 1 = project_id, item 2 = title.
+          4. Things 3 → Find Project where ID matches item 1.
+          5. Things 3 → Add Heading: title = item 2, Project = the
              found project.
           6. Stop and Output: the new heading's ``ID``.
 
-        Input wire format (single text line): ``"<project_id>|<title>"``.
-        Output: the new heading's UUID.
+        Input wire format: project_id, newline, title. Output: the
+        new heading's UUID.
         """
-        if "|" in name:
-            raise ValueError("heading name cannot contain '|' (used as wire separator)")
+        if "\n" in name:
+            raise ValueError("heading name cannot contain a newline (used as wire separator)")
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as inp:
-            inp.write(f"{project_id}|{name}")
+            inp.write(f"{project_id}\n{name}")
             in_path = inp.name
         out_path = in_path + ".out"
         try:
