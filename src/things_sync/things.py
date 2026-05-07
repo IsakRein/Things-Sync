@@ -12,11 +12,14 @@ networked / cloud-direct write path.
 """
 from __future__ import annotations
 
+import subprocess
+import tempfile
 import time
 from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime
 from enum import Enum
+from pathlib import Path
 from typing import Iterable
 
 from . import _osascript as osa
@@ -27,6 +30,7 @@ from .models import Area, Contact, Heading, ListInfo, Project, Status, Tag, Todo
 
 TELL = 'application id "com.culturedcode.ThingsMac"'
 BUILTIN_LISTS = ("Inbox", "Today", "Anytime", "Upcoming", "Someday", "Logbook", "Trash")
+SHORTCUT_ADD_HEADING = "Things-Sync Add Heading"
 
 _STATUS_AS = {
     Status.OPEN: "open",
@@ -305,6 +309,71 @@ class Things:
         end tell
         """
         return _parse_contact(osa.run(script(body)).split(US))
+
+    def create_heading(self, project_id: str, name: str, *, timeout: float = 30.0) -> Heading:
+        """Create a heading inside a project via Shortcuts.app.
+
+        Things 3's AppleScript dictionary doesn't expose heading creation
+        (``make new heading`` raises -2753). The Shortcuts app, however,
+        does — so this routes through a user-configured shortcut.
+
+        One-time setup in Shortcuts.app:
+          1. New Shortcut → name it exactly ``Things-Sync Add Heading``.
+          2. Receive Shortcut Input as Text.
+          3. Split text by ``|`` → first match = project_id, second = title.
+          4. Things 3 → Find Project where ID matches ``project_id``.
+          5. Things 3 → Add Heading: title = the title text, Project = the
+             found project.
+          6. Stop and Output: the new heading's ``ID``.
+
+        Input wire format (single text line): ``"<project_id>|<title>"``.
+        Output: the new heading's UUID.
+        """
+        if "|" in name:
+            raise ValueError("heading name cannot contain '|' (used as wire separator)")
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as inp:
+            inp.write(f"{project_id}|{name}")
+            in_path = inp.name
+        out_path = in_path + ".out"
+        try:
+            result = subprocess.run(
+                [
+                    "/usr/bin/shortcuts", "run", SHORTCUT_ADD_HEADING,
+                    "-i", in_path, "-o", out_path,
+                    "--output-type", "public.plain-text",
+                ],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"`shortcuts run {SHORTCUT_ADD_HEADING}` failed "
+                    f"(exit {result.returncode}): {result.stderr.strip() or result.stdout.strip()}. "
+                    "Is the shortcut set up? See Things.create_heading docstring."
+                )
+            uuid = ""
+            try:
+                uuid = Path(out_path).read_text().strip()
+            except FileNotFoundError:
+                pass
+        finally:
+            for p in (in_path, out_path):
+                try:
+                    Path(p).unlink()
+                except FileNotFoundError:
+                    pass
+
+        if uuid:
+            h = self.db.heading(uuid)
+            if h is not None:
+                return h
+        # Fallback: shortcut didn't surface a usable id — match by name in project.
+        matches = [h for h in self.db.headings() if h.project_id == project_id and h.name == name]
+        if not matches:
+            raise RuntimeError(
+                f"create_heading ran but no heading appeared under project {project_id!r} "
+                f"with name {name!r} (shortcut output: {uuid!r})"
+            )
+        return matches[-1]
 
     def parse_quicksilver(self, text: str) -> Todo:
         """Pop the Quick Entry parser — UI-only feature."""
@@ -610,6 +679,10 @@ class Things:
             end try
             try
                 delete (tag id {as_str(id)})
+                return
+            end try
+            try
+                delete (heading id {as_str(id)})
                 return
             end try
         end tell
