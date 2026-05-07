@@ -31,6 +31,7 @@ from .models import Area, Contact, Heading, ListInfo, Project, Status, Tag, Todo
 TELL = 'application id "com.culturedcode.ThingsMac"'
 BUILTIN_LISTS = ("Inbox", "Today", "Anytime", "Upcoming", "Someday", "Logbook", "Trash")
 SHORTCUT_ADD_HEADING = "Things-Sync Add Heading"
+SHORTCUT_DELETE_HEADING = "Things-Sync Delete Heading"
 
 _STATUS_AS = {
     Status.OPEN: "open",
@@ -310,35 +311,19 @@ class Things:
         """
         return _parse_contact(osa.run(script(body)).split(US))
 
-    def create_heading(self, project_id: str, name: str, *, timeout: float = 30.0) -> Heading:
-        """Create a heading inside a project via Shortcuts.app.
-
-        Things 3's AppleScript dictionary doesn't expose heading creation
-        (``make new heading`` raises -2753). The Shortcuts app, however,
-        does — so this routes through a user-configured shortcut.
-
-        One-time setup in Shortcuts.app:
-          1. New Shortcut → name it exactly ``Things-Sync Add Heading``.
-          2. Receive Shortcut Input as Text.
-          3. Split Text by **New Lines** → item 1 = project_id, item 2 = title.
-          4. Things 3 → Find Project where ID matches item 1.
-          5. Things 3 → Add Heading: title = item 2, Project = the
-             found project.
-          6. Stop and Output: the new heading's ``ID``.
-
-        Input wire format: project_id, newline, title. Output: the
-        new heading's UUID.
+    @staticmethod
+    def _run_shortcut(name: str, payload: str, *, timeout: float = 30.0) -> str:
+        """Run a Shortcuts.app shortcut by name, send ``payload`` on stdin
+        (via temp file), return stdout text. Raises if the shortcut errors.
         """
-        if "\n" in name:
-            raise ValueError("heading name cannot contain a newline (used as wire separator)")
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as inp:
-            inp.write(f"{project_id}\n{name}")
+            inp.write(payload)
             in_path = inp.name
         out_path = in_path + ".out"
         try:
             result = subprocess.run(
                 [
-                    "/usr/bin/shortcuts", "run", SHORTCUT_ADD_HEADING,
+                    "/usr/bin/shortcuts", "run", name,
                     "-i", in_path, "-o", out_path,
                     "--output-type", "public.plain-text",
                 ],
@@ -346,15 +331,14 @@ class Things:
             )
             if result.returncode != 0:
                 raise RuntimeError(
-                    f"`shortcuts run {SHORTCUT_ADD_HEADING}` failed "
-                    f"(exit {result.returncode}): {result.stderr.strip() or result.stdout.strip()}. "
-                    "Is the shortcut set up? See Things.create_heading docstring."
+                    f"`shortcuts run {name}` failed (exit {result.returncode}): "
+                    f"{result.stderr.strip() or result.stdout.strip()}. "
+                    "Is the shortcut set up?"
                 )
-            uuid = ""
             try:
-                uuid = Path(out_path).read_text().strip()
+                return Path(out_path).read_text().strip()
             except FileNotFoundError:
-                pass
+                return ""
         finally:
             for p in (in_path, out_path):
                 try:
@@ -362,6 +346,41 @@ class Things:
                 except FileNotFoundError:
                     pass
 
+    def create_heading(self, project_id: str, name: str, *, timeout: float = 30.0) -> Heading:
+        """Create a heading inside a project via Shortcuts.app.
+
+        Things 3's AppleScript dictionary doesn't expose heading creation
+        (``make new heading`` raises -2753). The Shortcuts app, however,
+        does — so this routes through a user-configured shortcut.
+
+        We resolve ``project_id`` to the project's title locally and send
+        the title to the Shortcut, because Things' "Add Heading" action
+        takes a project by name (avoids needing a "Find Projects" step
+        in the Shortcut).
+
+        One-time setup in Shortcuts.app:
+          1. New Shortcut → name it exactly ``Things-Sync Add Heading``.
+          2. Receive Shortcut Input as Text.
+          3. Split Text by **New Lines** → item 1 = project_title, item 2 = title.
+          4. Things 3 → Add Heading: title = item 2, Project = item 1.
+          5. Stop and Output: the new heading's ``ID``.
+
+        Input wire format: project_title, newline, title. Output: the
+        new heading's UUID.
+        """
+        if "\n" in name:
+            raise ValueError("heading name cannot contain a newline (used as wire separator)")
+        project = self.db.project(project_id)
+        if project is None:
+            raise ValueError(f"no project with id {project_id!r}")
+        if "\n" in project.name:
+            raise ValueError(
+                f"project {project_id!r} title contains a newline; rename it before "
+                "creating headings via the Shortcut"
+            )
+        uuid = self._run_shortcut(
+            SHORTCUT_ADD_HEADING, f"{project.name}\n{name}", timeout=timeout,
+        )
         if uuid:
             h = self.db.heading(uuid)
             if h is not None:
@@ -374,6 +393,37 @@ class Things:
                 f"with name {name!r} (shortcut output: {uuid!r})"
             )
         return matches[-1]
+
+    def delete_heading(self, heading_id: str, *, timeout: float = 30.0) -> None:
+        """Delete a heading via Shortcuts.app.
+
+        AppleScript has no ``heading`` class, so this routes through a
+        user-configured Shortcut named ``Things-Sync Delete Heading``.
+
+        One-time setup in Shortcuts.app:
+          1. New Shortcut → name it exactly ``Things-Sync Delete Heading``.
+          2. Receive Shortcut Input as Text.
+          3. Things 3 → **Find Headings** with filter ``ID`` ``is``
+             ``Shortcut Input``, Limit = 1.
+          4. Things 3 → **Delete Items** (or **Trash**) on the result.
+
+        No output is required from the Shortcut.
+        """
+        if not heading_id:
+            raise ValueError("heading_id is required")
+        if self.db.heading(heading_id) is None:
+            raise ValueError(f"no heading with id {heading_id!r}")
+        self._run_shortcut(SHORTCUT_DELETE_HEADING, heading_id, timeout=timeout)
+        # Confirm: heading row is either gone or marked trashed in TMTask.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            h = self.db.heading(heading_id, include_trashed=False)
+            if h is None:
+                return
+            time.sleep(0.1)
+        raise RuntimeError(
+            f"delete_heading ran but heading {heading_id!r} is still active in the DB"
+        )
 
     def parse_quicksilver(self, text: str) -> Todo:
         """Pop the Quick Entry parser — UI-only feature."""
@@ -679,10 +729,6 @@ class Things:
             end try
             try
                 delete (tag id {as_str(id)})
-                return
-            end try
-            try
-                delete (heading id {as_str(id)})
                 return
             end try
         end tell

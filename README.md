@@ -56,7 +56,7 @@ t.empty_trash()          # purge
 | Area     | AS     | DB   | name, tags, collapsed | n/a | `delete` |
 | Tag      | AS     | DB   | name, shortcut, parent | n/a | `delete` |
 | Contact  | AS     | DB   | not exposed | n/a | not exposed |
-| Heading  | Shortcut | DB | not exposed | n/a | `delete` |
+| Heading  | Shortcut | DB | not exposed | n/a | Shortcut |
 
 ### Editing semantics
 
@@ -186,14 +186,17 @@ Frozen dataclasses in `things_sync.models`: `Todo`, `Project`, `Heading`,
 The AS dictionary doesn't cover everything Things' UI exposes; we
 keep the wrapper to what AS can actually do reliably:
 
-- **Headings: create via Shortcuts, delete via AS.** AppleScript
-  has no `make new heading` (raises -2753), so `Things.create_heading
-  (project_id, name)` shells out to `shortcuts run` against a
-  user-configured Shortcut named `Things-Sync Add Heading` (one-time
-  setup — see the docstring on `create_heading`). AS *can* delete
-  headings, so `Things.delete(heading_id)` works. Renaming or
-  moving todos under an existing heading still has to be done in
-  the Things UI.
+- **Headings: create + delete via Shortcuts; rename UI-only.**
+  AppleScript has no `heading` class at all — neither `make new
+  heading` nor `delete (heading id ...)` parse. Both create and
+  delete route through Shortcuts.app:
+  `Things.create_heading(project_id, name)` shells out to
+  `shortcuts run "Things-Sync Add Heading"`, and
+  `Things.delete_heading(heading_id)` shells out to
+  `shortcuts run "Things-Sync Delete Heading"`. Both Shortcuts
+  must be set up once by the user — see the docstrings on the
+  two methods for the action recipes. Renaming a heading and
+  reassigning todos under one are still UI-only.
 - **No programmatic date clearing.** AS rejects
   `set due date of t to missing value` for date-typed properties.
   `update_todo(id, due_date=None)` raises. Clear due dates from
